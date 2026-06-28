@@ -1,0 +1,293 @@
+"""Structured local exercise database + filtering.
+
+No external services. Each exercise carries everything the UI and the
+recommendation engine need: muscles, difficulty, type, instructions, common
+mistakes, benefits, and baseline sets/reps/rest. The engine (workout.py) selects
+from this database with deterministic rules — never random, never OpenAI.
+
+Equipment tokens: bodyweight | bands | dumbbell | home | gym
+Categories:       glutes | legs | core | upper | full
+Types:            compound | isolation | core | conditioning
+Difficulty:       beginner | intermediate | advanced
+"""
+from __future__ import annotations
+
+# What's usable given the single equipment option the user picks.
+AVAILABILITY = {
+    "bodyweight": {"bodyweight"},
+    "bands": {"bodyweight", "bands"},
+    "dumbbell": {"bodyweight", "dumbbell"},
+    "home": {"bodyweight", "bands", "dumbbell", "home"},
+    "gym": {"bodyweight", "bands", "dumbbell", "home", "gym"},
+}
+DIFFICULTY = {"beginner": 1, "intermediate": 2, "advanced": 3}
+CATEGORIES = ["glutes", "legs", "core", "upper", "full"]
+
+
+def _ex(name, image, equipment, primary, secondary, difficulty, category, etype,
+        instructions, mistakes, benefits, sets, reps, rest):
+    return {
+        "name": name, "image": image, "equipment": equipment,
+        "primary_muscles": primary, "secondary_muscles": secondary,
+        "difficulty": difficulty, "category": category, "type": etype,
+        "instructions": instructions, "common_mistakes": mistakes, "benefits": benefits,
+        "sets": sets, "reps": reps, "rest": rest,
+    }
+
+
+EXERCISES = [
+    # ---------------- GLUTES ----------------
+    _ex("Hip Thrust", "🍑", ["dumbbell", "home", "gym"], ["Glutes"], ["Hamstrings", "Quads"], "intermediate", "glutes", "compound",
+        "Upper back on a bench, drive through your heels and squeeze your glutes hard at the top until hips are level with knees.",
+        ["Overarching the lower back at the top", "Pushing through the toes instead of heels", "Not reaching full hip extension"],
+        ["Best overall glute builder", "Strong glute-specific overload", "Protects the lower back"], 4, "8-12", "75s"),
+    _ex("Glute Bridge", "🍑", ["bodyweight", "bands", "dumbbell", "home", "gym"], ["Glutes"], ["Hamstrings", "Core"], "beginner", "glutes", "compound",
+        "Lying on your back, feet flat, push hips to the ceiling and squeeze your glutes, then lower with control.",
+        ["Rushing the reps", "Arching the back instead of squeezing glutes"],
+        ["Beginner-friendly glute activation", "No equipment needed"], 3, "12-15", "45s"),
+    _ex("Romanian Deadlift", "🦵", ["dumbbell", "home", "gym"], ["Hamstrings", "Glutes"], ["Lower back"], "intermediate", "glutes", "compound",
+        "Soft knees, hinge at the hips pushing your butt back, keep the weights close to your legs, feel the hamstring stretch, then drive up.",
+        ["Rounding the back", "Turning it into a squat", "Going too heavy too soon"],
+        ["Builds glutes and hamstrings", "Improves hip hinge strength"], 4, "8-12", "75s"),
+    _ex("Bulgarian Split Squat", "🍑", ["bodyweight", "dumbbell", "home", "gym"], ["Glutes", "Quads"], ["Hamstrings"], "intermediate", "glutes", "compound",
+        "Rear foot on a bench, drop the back knee toward the floor staying tall, drive up through the front heel.",
+        ["Leaning too far forward", "Front knee caving inward"],
+        ["Single-leg strength & symmetry", "Big glute & quad stimulus"], 3, "10-12", "60s"),
+    _ex("Banded Kickback", "🍑", ["bands", "home", "gym"], ["Glutes"], [], "beginner", "glutes", "isolation",
+        "Anchor a band to the ankle (or a cable at the gym), kick the leg straight back squeezing the glute, control the return.",
+        ["Using momentum", "Arching the lower back"],
+        ["Pure glute isolation", "Great mind-muscle finisher"], 3, "12-15", "45s"),
+    _ex("Step Ups", "🦵", ["bodyweight", "dumbbell", "home", "gym"], ["Glutes", "Quads"], ["Calves"], "beginner", "glutes", "compound",
+        "Step onto a sturdy box driving through the top foot, stand tall, lower with control.",
+        ["Pushing off the bottom foot", "Box too low to challenge glutes"],
+        ["Functional single-leg power", "Glute & quad builder"], 3, "10-12", "60s"),
+    _ex("Reverse Lunges", "🍑", ["bodyweight", "dumbbell", "home", "gym"], ["Glutes", "Quads"], ["Hamstrings"], "beginner", "glutes", "compound",
+        "Step back into a lunge, drop the back knee, drive through the front heel to return.",
+        ["Short steps that hit quads only", "Letting the front knee pass the toes excessively"],
+        ["Knee-friendly lunge variation", "Strong glute emphasis"], 3, "10-12", "60s"),
+    _ex("Frog Pumps", "🐸", ["bodyweight", "bands", "home", "gym"], ["Glutes"], [], "beginner", "glutes", "isolation",
+        "Soles of feet together, knees out, pump the hips up squeezing the glutes.",
+        ["Not squeezing at the top", "Going too fast"],
+        ["High-rep glute pump", "Great activation or finisher"], 3, "15-20", "30s"),
+    _ex("Banded Lateral Walk", "🦵", ["bands", "home", "gym"], ["Glute medius"], ["Quads"], "beginner", "glutes", "isolation",
+        "Band above the knees, half-squat, step sideways keeping tension, don't let knees cave.",
+        ["Letting knees collapse inward", "Standing up too tall"],
+        ["Hip stability & glute shaping", "Activates side glutes"], 3, "12-15 / side", "30s"),
+    _ex("Sumo Squat", "🍑", ["bodyweight", "dumbbell", "home", "gym"], ["Glutes", "Quads", "Adductors"], [], "beginner", "glutes", "compound",
+        "Wide stance, toes out, sit straight down keeping the chest tall, drive up through the heels.",
+        ["Knees caving in", "Leaning forward"],
+        ["Targets glutes and inner thighs", "Beginner friendly"], 3, "12-15", "60s"),
+
+    # ---------------- LEGS ----------------
+    _ex("Goblet Squat", "🦵", ["dumbbell", "home", "gym"], ["Quads", "Glutes"], ["Core"], "beginner", "legs", "compound",
+        "Hold a weight at your chest, sit back and down keeping chest tall, drive up through the heels.",
+        ["Heels lifting", "Knees caving in"],
+        ["Teaches great squat form", "Full lower-body builder"], 3, "10-12", "60s"),
+    _ex("Bodyweight Squat", "🦵", ["bodyweight", "bands", "dumbbell", "home", "gym"], ["Quads", "Glutes"], ["Core"], "beginner", "legs", "compound",
+        "Feet shoulder-width, sit back and down to at least parallel, stand tall squeezing glutes.",
+        ["Half-repping", "Rounding the lower back"],
+        ["No equipment needed", "Foundational movement"], 3, "15-20", "45s"),
+    _ex("Walking Lunges", "🦵", ["bodyweight", "dumbbell", "home", "gym"], ["Quads", "Glutes"], ["Hamstrings"], "beginner", "legs", "compound",
+        "Step forward into a lunge, drop the back knee, push through the front heel into the next step.",
+        ["Steps too short", "Torso collapsing forward"],
+        ["Builds legs and balance", "High calorie burn"], 3, "12 / leg", "60s"),
+    _ex("Leg Press", "🦵", ["gym"], ["Quads", "Glutes"], ["Hamstrings"], "beginner", "legs", "compound",
+        "Feet shoulder-width on the platform, lower until knees reach ~90°, press without locking out hard.",
+        ["Lifting hips off the seat", "Bouncing at the bottom"],
+        ["Heavy quad/glute loading", "Back-supported and beginner safe"], 4, "10-12", "75s"),
+    _ex("Hack Squat", "🦵", ["gym"], ["Quads"], ["Glutes"], "intermediate", "legs", "compound",
+        "Shoulders under the pads, sit down keeping the whole back on the pad, drive up through mid-foot.",
+        ["Knees caving", "Coming up onto the toes"],
+        ["Strong quad development", "Very stable squat pattern"], 4, "10-12", "75s"),
+    _ex("Leg Extension", "🦵", ["gym"], ["Quads"], [], "beginner", "legs", "isolation",
+        "Seated, extend the knees to straighten the legs, squeeze the quads, lower slowly.",
+        ["Using momentum/swinging", "Slamming the weight down"],
+        ["Isolates the quads", "Great for definition"], 3, "12-15", "45s"),
+    _ex("Lying Leg Curl", "🦵", ["gym"], ["Hamstrings"], [], "beginner", "legs", "isolation",
+        "Curl the pad toward your glutes squeezing the hamstrings, lower with control.",
+        ["Hips lifting off the bench", "Jerking the weight"],
+        ["Isolates hamstrings", "Balances knee health"], 3, "12-15", "45s"),
+    _ex("Calf Raise", "🦵", ["bodyweight", "dumbbell", "home", "gym"], ["Calves"], [], "beginner", "legs", "isolation",
+        "Rise onto the balls of your feet as high as possible, pause, lower for a deep stretch.",
+        ["Bouncing", "Short range of motion"],
+        ["Builds calf shape", "Improves ankle strength"], 3, "15-20", "30s"),
+    _ex("Wall Sit", "🦵", ["bodyweight"], ["Quads"], ["Glutes"], "beginner", "legs", "isolation",
+        "Back against the wall, slide down to a 90° knee bend and hold steady, breathing evenly.",
+        ["Knees past the toes", "Hips too high"],
+        ["Builds endurance", "Zero equipment"], 3, "30-45s", "40s"),
+
+    # ---------------- CORE ----------------
+    _ex("Plank", "🔥", ["bodyweight"], ["Core"], ["Shoulders"], "beginner", "core", "core",
+        "Forearms down, body in a straight line from head to heels, brace the abs and squeeze glutes.",
+        ["Hips sagging or piking", "Holding your breath"],
+        ["Total-core stability", "Protects the spine"], 3, "30-45s", "30s"),
+    _ex("Dead Bug", "🔥", ["bodyweight"], ["Core"], [], "beginner", "core", "core",
+        "On your back, extend the opposite arm and leg slowly while keeping your lower back pressed down.",
+        ["Lower back arching off the floor", "Moving too fast"],
+        ["Safe deep-core training", "Improves coordination"], 3, "10 / side", "30s"),
+    _ex("Russian Twist", "🔥", ["bodyweight", "dumbbell"], ["Obliques", "Core"], [], "beginner", "core", "core",
+        "Seated, lean back slightly, rotate the torso side to side under control (add weight to progress).",
+        ["Only moving the arms", "Rounding the back"],
+        ["Targets the obliques", "Improves rotational strength"], 3, "20 total", "30s"),
+    _ex("Hanging Leg Raise", "🔥", ["gym"], ["Lower abs"], ["Hip flexors"], "advanced", "core", "core",
+        "Hang from a bar, raise straight legs toward the bar without swinging, lower slowly.",
+        ["Swinging for momentum", "Only using hip flexors"],
+        ["Strong lower-ab development", "Builds grip too"], 3, "10-12", "45s"),
+    _ex("Bicycle Crunch", "🔥", ["bodyweight"], ["Core", "Obliques"], [], "beginner", "core", "core",
+        "Bring opposite elbow to opposite knee in a pedalling motion, fully extending the other leg.",
+        ["Pulling on the neck", "Rushing the reps"],
+        ["Hits abs and obliques", "No equipment"], 3, "20 total", "30s"),
+    _ex("Mountain Climbers", "⚡", ["bodyweight"], ["Core"], ["Shoulders"], "beginner", "core", "conditioning",
+        "In a plank, drive the knees toward the chest alternately at a steady, controlled pace.",
+        ["Hips rising too high", "Losing the plank line"],
+        ["Core + conditioning", "Raises the heart rate"], 3, "30s", "30s"),
+    _ex("Cable Crunch", "🔥", ["gym"], ["Core"], [], "intermediate", "core", "core",
+        "Kneel under a rope, crunch down by rounding the spine and contracting the abs, control the return.",
+        ["Pulling with the arms", "Using the hips instead of abs"],
+        ["Loadable ab training", "Builds visible core strength"], 3, "12-15", "45s"),
+    _ex("Side Plank", "🔥", ["bodyweight"], ["Obliques", "Core"], [], "beginner", "core", "core",
+        "On one forearm, stack the feet and lift the hips into a straight line, hold and breathe.",
+        ["Hips dropping", "Rotating the torso"],
+        ["Targets the obliques", "Improves lateral stability"], 3, "30s / side", "30s"),
+
+    # ---------------- UPPER BODY ----------------
+    _ex("Lat Pulldown", "💪", ["gym"], ["Lats", "Back"], ["Biceps"], "beginner", "upper", "compound",
+        "Grip wider than shoulders, pull the bar to your upper chest squeezing the shoulder blades down.",
+        ["Leaning back too far", "Pulling with the arms only"],
+        ["Builds a strong back", "Improves posture"], 4, "10-12", "60s"),
+    _ex("Bent-over Row", "💪", ["dumbbell", "home", "gym"], ["Back"], ["Biceps"], "intermediate", "upper", "compound",
+        "Hinge forward with a flat back, row the weights to your ribs squeezing the shoulder blades.",
+        ["Rounding the back", "Shrugging the shoulders"],
+        ["Thickens the back", "Balances pushing work"], 4, "10-12", "60s"),
+    _ex("Seated Cable Row", "💪", ["gym"], ["Back"], ["Biceps"], "beginner", "upper", "compound",
+        "Tall chest, pull the handle to your stomach driving the elbows back, control the return.",
+        ["Using the lower back to yank", "Rounding forward"],
+        ["Back-friendly rowing", "Great mid-back builder"], 3, "10-12", "60s"),
+    _ex("Shoulder Press", "💪", ["dumbbell", "home", "gym"], ["Shoulders"], ["Triceps"], "beginner", "upper", "compound",
+        "Press the weights overhead without flaring the ribs, lower to ear height with control.",
+        ["Arching the lower back", "Half-repping"],
+        ["Builds shoulder strength", "Toned upper body"], 3, "10-12", "60s"),
+    _ex("Chest Press", "💪", ["dumbbell", "home", "gym"], ["Chest"], ["Triceps", "Shoulders"], "beginner", "upper", "compound",
+        "Lying back, press the weights up over the chest, lower slowly to a stretch.",
+        ["Bouncing off the chest", "Flaring elbows to 90°"],
+        ["Upper-body pushing strength", "Tones chest & arms"], 3, "10-12", "60s"),
+    _ex("Push-up", "💪", ["bodyweight"], ["Chest", "Triceps"], ["Shoulders", "Core"], "beginner", "upper", "compound",
+        "Hands under shoulders, body in a straight line, lower the chest to the floor and press up (drop to knees to scale).",
+        ["Hips sagging", "Flaring the elbows wide"],
+        ["No equipment pushing", "Builds chest, arms & core"], 3, "8-15", "45s"),
+    _ex("Bicep Curl", "💪", ["dumbbell", "bands", "home", "gym"], ["Biceps"], [], "beginner", "upper", "isolation",
+        "Elbows tucked, curl the weights up squeezing the biceps, lower slowly.",
+        ["Swinging the body", "Using momentum"],
+        ["Isolates the biceps", "Toned arms"], 3, "12-15", "45s"),
+    _ex("Tricep Pushdown", "💪", ["bands", "home", "gym"], ["Triceps"], [], "beginner", "upper", "isolation",
+        "Elbows pinned to your sides, push the band/bar down until arms are straight, control the return.",
+        ["Elbows drifting forward", "Using the shoulders"],
+        ["Isolates the triceps", "Defines the back of the arm"], 3, "12-15", "45s"),
+    _ex("Lateral Raise", "💪", ["dumbbell", "bands", "home", "gym"], ["Shoulders"], [], "beginner", "upper", "isolation",
+        "Soft elbows, raise the weights out to the sides to shoulder height, lower slowly.",
+        ["Using momentum", "Shrugging the traps"],
+        ["Builds shoulder shape", "Creates an athletic look"], 3, "12-15", "40s"),
+    _ex("Band Pull-Apart", "💪", ["bands", "home", "gym"], ["Upper back", "Rear delts"], [], "beginner", "upper", "isolation",
+        "Hold a band at shoulder height, pull it apart squeezing the shoulder blades, return slowly.",
+        ["Bending the elbows", "Rushing"],
+        ["Improves posture", "Healthy shoulders"], 3, "15-20", "30s"),
+    _ex("Single-Arm Dumbbell Row", "💪", ["dumbbell", "home", "gym"], ["Back"], ["Biceps"], "beginner", "upper", "compound",
+        "One hand on a bench, row the dumbbell to your hip keeping the back flat, lower with control.",
+        ["Rotating the torso to lift", "Rounding the back"],
+        ["Builds back symmetry", "Beginner friendly"], 3, "10-12", "60s"),
+    _ex("Pike Push-up", "💪", ["bodyweight"], ["Shoulders"], ["Triceps"], "beginner", "upper", "compound",
+        "Hips high in an inverted V, lower the top of your head toward the floor, press back up.",
+        ["Hips dropping", "Hands too far forward"],
+        ["Bodyweight shoulder builder", "No equipment"], 3, "8-12", "45s"),
+    _ex("Superman", "💪", ["bodyweight"], ["Lower back", "Back"], ["Glutes"], "beginner", "upper", "isolation",
+        "Lying face down, lift the arms, chest and legs, squeeze the back, lower with control.",
+        ["Yanking the neck up", "Holding your breath"],
+        ["Strengthens the back chain", "Improves posture"], 3, "12-15", "30s"),
+    _ex("Tricep Dip", "💪", ["bodyweight"], ["Triceps"], ["Chest", "Shoulders"], "beginner", "upper", "compound",
+        "Hands on a chair behind you, bend the elbows to lower the hips, press back up.",
+        ["Shrugging the shoulders", "Going too deep too soon"],
+        ["Bodyweight arm builder", "Done anywhere"], 3, "10-15", "45s"),
+
+    # ---------------- FULL BODY ----------------
+    _ex("Burpees", "⚡", ["bodyweight"], ["Full body"], ["Core"], "intermediate", "full", "conditioning",
+        "Squat, kick back to a plank, do a push-up, jump the feet in and explode up.",
+        ["Sagging hips in the plank", "Skipping the push-up"],
+        ["Huge calorie burn", "Total-body conditioning"], 3, "30s", "30s"),
+    _ex("Dumbbell Thruster", "⚡", ["dumbbell", "home", "gym"], ["Quads", "Shoulders"], ["Glutes", "Core"], "intermediate", "full", "compound",
+        "Front-rack the dumbbells, squat down, then drive up and press overhead in one motion.",
+        ["Pressing before standing", "Rushing and losing form"],
+        ["Full-body strength + cardio", "Time-efficient"], 3, "10-12", "60s"),
+    _ex("Dumbbell Swing", "⚡", ["dumbbell", "home", "gym"], ["Glutes", "Hamstrings"], ["Core", "Shoulders"], "intermediate", "full", "conditioning",
+        "Hinge at the hips and swing the weight to chest height using a powerful glute snap, not the arms.",
+        ["Squatting instead of hinging", "Using the arms to lift"],
+        ["Explosive glute power", "Conditioning + strength"], 3, "15", "45s"),
+    _ex("Squat to Press", "⚡", ["dumbbell", "home", "gym"], ["Quads", "Shoulders"], ["Glutes"], "beginner", "full", "compound",
+        "Squat with the weights at your shoulders, stand and press overhead, return under control.",
+        ["Leaning back on the press", "Half-squatting"],
+        ["Works the whole body", "Great beginner compound"], 3, "10-12", "60s"),
+    _ex("Jumping Jacks", "⚡", ["bodyweight"], ["Full body"], [], "beginner", "full", "conditioning",
+        "Jump the feet out and arms overhead, then back in, at a steady rhythm.",
+        ["Tensing the shoulders", "Landing heavily"],
+        ["Easy warm-up or finisher", "Raises heart rate"], 3, "40s", "20s"),
+    _ex("Bear Crawl", "⚡", ["bodyweight"], ["Full body", "Core"], ["Shoulders"], "beginner", "full", "conditioning",
+        "On hands and toes with knees hovering, crawl forward and back keeping the hips low and steady.",
+        ["Hips bouncing up and down", "Moving too fast"],
+        ["Core + full-body control", "Builds coordination"], 3, "30s", "30s"),
+    _ex("Renegade Row", "⚡", ["dumbbell", "home", "gym"], ["Back", "Core"], ["Biceps"], "advanced", "full", "compound",
+        "In a plank gripping dumbbells, row one to your hip while resisting torso rotation, alternate.",
+        ["Hips twisting", "Feet too narrow"],
+        ["Back strength + anti-rotation core", "Full-body challenge"], 3, "8-10 / side", "60s"),
+
+    # ---- Home-friendly additions (bodyweight / dumbbell / band only) ----
+    _ex("Single-Leg Glute Bridge", "🍑", ["bodyweight", "home", "gym"], ["Glutes"], ["Hamstrings", "Core"], "intermediate", "glutes", "isolation",
+        "From a glute bridge, extend one leg straight, drive through the planted heel to lift the hips level, lower with control.",
+        ["Hips tilting to one side", "Pushing through the toes"],
+        ["Builds single-side glute strength", "Fixes imbalances at home"], 3, "12-15 / side", "40s"),
+    _ex("Donkey Kicks", "🍑", ["bodyweight", "bands", "home", "gym"], ["Glutes"], ["Hamstrings"], "beginner", "glutes", "isolation",
+        "On all fours, keeping the knee bent at 90°, drive one heel toward the ceiling squeezing the glute, lower without touching down.",
+        ["Arching the lower back", "Swinging with momentum"],
+        ["Pure glute activation", "No equipment needed"], 3, "15-20 / side", "30s"),
+    _ex("Curtsy Lunge", "🦵", ["bodyweight", "dumbbell", "home", "gym"], ["Glutes", "Quads"], ["Adductors"], "intermediate", "glutes", "compound",
+        "Step one leg diagonally behind the other and lower into a curtsy, drive back up through the front heel.",
+        ["Knee caving inward", "Leaning the torso forward"],
+        ["Targets side glutes", "Improves balance & control"], 3, "12 / side", "45s"),
+    _ex("Lateral Lunge", "🦵", ["bodyweight", "dumbbell", "home", "gym"], ["Quads", "Glutes"], ["Adductors"], "beginner", "legs", "compound",
+        "Step wide to one side, sit back into that hip keeping the other leg straight, push back to centre.",
+        ["Rounding the back", "Knee passing the toes"],
+        ["Trains the legs in a new plane", "Great mobility + strength"], 3, "10-12 / side", "45s"),
+    _ex("Jump Squat", "🦵", ["bodyweight", "home", "gym"], ["Quads", "Glutes"], ["Calves"], "intermediate", "legs", "conditioning",
+        "Drop into a squat then explode straight up, land softly through the whole foot and immediately re-absorb into the next rep.",
+        ["Landing with locked knees", "Caving knees on landing"],
+        ["Builds power + raises heart rate", "No equipment needed"], 3, "12-15", "40s"),
+    _ex("Flutter Kicks", "🔥", ["bodyweight"], ["Lower abs"], ["Hip flexors"], "beginner", "core", "core",
+        "Lying on your back, lower back pressed down, lift the heels a few inches and alternate small rapid up-down kicks.",
+        ["Lower back arching off the floor", "Kicking too high"],
+        ["Targets the lower abs", "Anywhere, anytime core work"], 3, "30-40 reps", "30s"),
+    _ex("Reverse Crunch", "🔥", ["bodyweight"], ["Lower abs"], ["Core"], "beginner", "core", "core",
+        "On your back, knees bent, curl the hips off the floor bringing the knees toward the chest, lower slowly.",
+        ["Swinging the legs for momentum", "Pulling with the neck"],
+        ["Hits the hard-to-reach lower abs", "Gentle on the spine"], 3, "15-20 reps", "30s"),
+    _ex("Incline Push-up", "💪", ["bodyweight", "home", "gym"], ["Chest"], ["Triceps", "Shoulders"], "beginner", "upper", "compound",
+        "Hands on a sturdy elevated surface (sofa, counter), body in a straight line, lower the chest to the edge and press back up.",
+        ["Hips sagging or piking", "Flaring the elbows wide"],
+        ["Beginner-friendly chest builder", "Done with home furniture"], 3, "12-15", "45s"),
+]
+
+
+def select_pools(equipment: str, level: str) -> dict:
+    """Return {category: [exercises]} usable with the given equipment & level,
+    ordered compounds-first (deterministic) so the engine picks the big lifts
+    before isolation/conditioning work."""
+    available = AVAILABILITY.get(equipment, AVAILABILITY["bodyweight"])
+    max_diff = DIFFICULTY.get(level, 1)
+    type_order = {"compound": 0, "conditioning": 1, "core": 2, "isolation": 3}
+    pools = {c: [] for c in CATEGORIES}
+    for ex in EXERCISES:
+        if not (set(ex["equipment"]) & available):
+            continue
+        if DIFFICULTY[ex["difficulty"]] > max_diff:
+            continue
+        pools[ex["category"]].append(ex)
+    for c in pools:
+        pools[c].sort(key=lambda e: (type_order.get(e["type"], 9), e["name"]))
+    return pools

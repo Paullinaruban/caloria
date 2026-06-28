@@ -1,0 +1,3 @@
+# Caloria backend uses ONLY the Python standard library — there are no
+# third-party dependencies to install. This file exists so the host (Render)
+# detects the project as Python and provisions the runtime.

@@ -1,0 +1,63 @@
+# Render Blueprint for the Caloria backend — PRODUCTION (persistent) by default.
+# Connect this repo to Render as a "Blueprint" and it configures everything,
+# including durable storage so NO user data is lost on restart/redeploy/sleep.
+services:
+  - type: web
+    name: caloria-api
+    runtime: python
+    # Starter is required for a Persistent Disk (the free plan cannot have one).
+    plan: starter
+    buildCommand: ""
+    startCommand: python server.py
+    healthCheckPath: /api/health
+
+    # Persistent Disk — the single SQLite database lives here and survives every
+    # restart, redeploy, and sleep. This is what makes the deployment production-safe.
+    disk:
+      name: caloria-data
+      mountPath: /data
+      sizeGB: 1
+
+    envVars:
+      # Database file lives on the persistent disk (NOT the ephemeral container FS).
+      - key: CALORIA_DB
+        value: /data/caloria.db
+      - key: PYTHON_VERSION
+        value: "3.11.9"
+      - key: REQUIRE_EMAIL_VERIFICATION
+        value: "false"
+      - key: ALLOWED_ORIGIN
+        value: "*"
+      - key: APP_SECRET
+        generateValue: true
+      # Admin allow-list — these emails can open /admin (the analytics dashboard).
+      # Add more, comma-separated, if you have other admins.
+      - key: ADMIN_EMAILS
+        value: "polinaryzova8@gmail.com"
+      # Motivational / reminder emails (Wed + Sun + situational ≈ 3×/week).
+      # The background scheduler only sends when this is "true" AND a Resend key
+      # is configured (RESEND_API_KEY + EMAIL_FROM below).
+      - key: EMAIL_RETENTION_ENABLED
+        value: "true"
+      # ---- Fill these in the Render dashboard when you want them ----
+      #   APP_BASE_URL          -> your Netlify site URL (https://your-site.netlify.app)
+      #                            REQUIRED for retention emails — the email CTA
+      #                            links point here (must NOT be localhost).
+      #   RESEND_API_KEY        -> re_...                       (REQUIRED to actually send emails)
+      #   EMAIL_FROM            -> Caloria <noreply@yourdomain>  (verified Resend domain)
+      #   STRIPE_SECRET_KEY     -> sk_test_... or sk_live_...   (subscription checkout)
+      #   STRIPE_WEBHOOK_SECRET -> whsec_...                    (subscription updates)
+      #   STRIPE_PRICE_MONTHLY  -> price_...                    (optional; auto-created if blank)
+      #   STRIPE_PRICE_YEARLY   -> price_...                    (optional; auto-created if blank)
+      #   OPENAI_API_KEY        -> sk-...                       (AI food scan)
+      #
+      # BACKUPS (recommended): Render → your service → Disks → caloria-data →
+      # enable daily Snapshots. Persistence protects against resets; snapshots
+      # protect against corruption or a bad deploy. Keep both on in production.
+
+# ---------------------------------------------------------------------------
+# PREVIEW / TESTING ONLY (NOT production): to try the app for free with NO
+# durable storage, change `plan: starter` to `plan: free` and DELETE the entire
+# `disk:` block above and the CALORIA_DB env var. On free, ALL data resets when
+# the service sleeps or redeploys — never use it for real users or real payments.
+# ---------------------------------------------------------------------------
