@@ -156,6 +156,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/config":
             return self._send(200, {
                 "openai_configured": config.openai_ready(),
+                "email_configured": config.email_ready(),
                 "usda_key": "DEMO_KEY" if config.USDA_API_KEY == "DEMO_KEY" else "configured",
                 "stripe_configured": config.stripe_ready(),
                 "images_enabled": images.available(),

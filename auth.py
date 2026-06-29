@@ -63,18 +63,31 @@ def signup(email: str, password: str, name: str = "") -> dict:
         if "UNIQUE" in str(e):
             raise AuthError("An account with that email already exists.", 409)
         raise
-    send_verification(user_id, email)  # best-effort; never blocks signup
-    return {"token": _new_session(user_id), "user": _public_user(_get_user(user_id))}
+    sent = send_verification(user_id, email)  # never blocks signup
+    return {
+        "token": _new_session(user_id),
+        "user": _public_user(_get_user(user_id)),
+        # So the frontend can avoid a fake "check your email" message when the
+        # email provider isn't configured or the send failed.
+        "verification_required": bool(config.REQUIRE_EMAIL_VERIFICATION),
+        "verification_email_sent": sent,
+    }
 
 
 # ---------- email verification (6-digit code) ----------
-def send_verification(user_id: int, email: str) -> None:
-    """Issue a fresh 6-digit verification code and email it. Never raises."""
+def send_verification(user_id: int, email: str) -> bool:
+    """Issue a fresh 6-digit verification code and email it. Returns True only if
+    the email was actually handed to the provider. Never raises."""
     try:
         code = tokens.issue_code(user_id, "verify", config.VERIFY_CODE_TTL_MINUTES)
+        if not config.email_ready():
+            print(f"[caloria] verification email NOT sent — email provider not configured ({email})")
+            return False
         email_send.send_verification_code(email, code)
+        return True
     except Exception as e:  # noqa: BLE001 — email problems must not break the flow
         print(f"[caloria] verification email failed for {email}: {e}")
+        return False
 
 
 def verify_email_code(email: str, code: str) -> bool:
