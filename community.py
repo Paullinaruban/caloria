@@ -207,12 +207,31 @@ def comments(post_id: int) -> list:
     _ensure()
     with db.cursor() as c:
         rows = c.execute(
-            "SELECT cm.text, cm.created_at, mp.username, mp.avatar, mp.avatar_img FROM post_comments cm "
+            "SELECT cm.id, cm.text, cm.created_at, mp.username, mp.avatar, mp.avatar_img FROM post_comments cm "
             "JOIN member_profiles mp ON mp.user_id=cm.user_id WHERE cm.post_id=? ORDER BY cm.id ASC LIMIT 100",
             (post_id,),
         ).fetchall()
-    return [{"text": r["text"], "created_at": r["created_at"], "username": r["username"],
+    return [{"id": r["id"], "text": r["text"], "created_at": r["created_at"], "username": r["username"],
              "avatar": r["avatar"], "avatar_img": r["avatar_img"]} for r in rows]
+
+
+# ---------------- admin moderation ----------------
+def delete_post(post_id: int) -> dict:
+    """Remove a post and all its likes & comments. Returns {ok, deleted}."""
+    _ensure()
+    with db.cursor() as c:
+        n = c.execute("DELETE FROM posts WHERE id=?", (post_id,)).rowcount
+        c.execute("DELETE FROM post_likes WHERE post_id=?", (post_id,))
+        c.execute("DELETE FROM post_comments WHERE post_id=?", (post_id,))
+    return {"ok": True, "deleted": n > 0}
+
+
+def delete_comment(comment_id: int) -> dict:
+    """Remove a single comment. Returns {ok, deleted}."""
+    _ensure()
+    with db.cursor() as c:
+        n = c.execute("DELETE FROM post_comments WHERE id=?", (comment_id,)).rowcount
+    return {"ok": True, "deleted": n > 0}
 
 
 def toggle_follow(uid: int, target: int) -> dict:

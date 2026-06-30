@@ -6,6 +6,8 @@ Nutrition numbers are intentionally NOT requested here — those come from USDA
 (see nutrition.py), so the model only does what vision models are good at:
 identifying foods and estimating portions.
 """
+import collections
+import hashlib
 import json
 import socket
 import ssl
@@ -15,6 +17,11 @@ import urllib.error
 
 import aicost
 import config
+
+# Identical-image cache: re-scanning the exact same photo returns the cached
+# result instantly with ZERO OpenAI cost (de-dupes duplicate requests).
+_VISION_CACHE = collections.OrderedDict()
+_VISION_CACHE_MAX = 256
 
 SYSTEM_PROMPT = (
     "You are a professional nutritionist's vision assistant. You analyse a "
@@ -70,6 +77,14 @@ def detect_ingredients(image_data_url: str, *, user_id=None) -> dict:
         raise VisionError(
             "OPENAI_API_KEY is not set. Add it to backend/.env to enable AI analysis."
         )
+
+    # De-dupe identical images — a cache hit costs nothing and is instant.
+    cache_key = hashlib.sha256(image_data_url.encode("utf-8", "ignore")).hexdigest()
+    cached = _VISION_CACHE.get(cache_key)
+    if cached is not None:
+        _VISION_CACHE.move_to_end(cache_key)
+        print(f"[caloria][AI] scan_vision CACHE HIT (no OpenAI call) user={user_id}")
+        return json.loads(json.dumps(cached))  # return a copy
 
     payload = {
         "model": config.OPENAI_VISION_MODEL,
@@ -166,12 +181,18 @@ def detect_ingredients(image_data_url: str, *, user_id=None) -> dict:
             }
         )
 
-    return {
+    result = {
         "meal_name": str(data.get("meal_name", "Meal")).strip()[:80] or "Meal",
         "meal_type": data.get("meal_type", "mixed"),
         "ingredients": ingredients,
         "overall_confidence": _clamp(data.get("overall_confidence", 0.5)),
     }
+    # cache only meaningful results (don't cache "no food found")
+    if ingredients:
+        _VISION_CACHE[cache_key] = result
+        if len(_VISION_CACHE) > _VISION_CACHE_MAX:
+            _VISION_CACHE.popitem(last=False)
+    return result
 
 
 def _clamp(v, lo=0.0, hi=1.0):

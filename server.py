@@ -308,7 +308,31 @@ class Handler(BaseHTTPRequestHandler):
             return self._delete_meal()
         if path == "/api/me":
             return self._delete_account()
+        if path == "/api/admin/community/post":
+            return self._admin_delete_post()
+        if path == "/api/admin/community/comment":
+            return self._admin_delete_comment()
         return self._send(404, {"error": "not found"})
+
+    def _admin_delete_post(self):
+        if not self._require_admin():
+            return
+        qs = parse_qs(urlparse(self.path).query)
+        try:
+            pid = int((qs.get("post_id") or [0])[0])
+        except (TypeError, ValueError):
+            return self._send(400, {"error": "post_id required"})
+        self._send(200, community.delete_post(pid))
+
+    def _admin_delete_comment(self):
+        if not self._require_admin():
+            return
+        qs = parse_qs(urlparse(self.path).query)
+        try:
+            cid = int((qs.get("comment_id") or [0])[0])
+        except (TypeError, ValueError):
+            return self._send(400, {"error": "comment_id required"})
+        self._send(200, community.delete_comment(cid))
 
     def _delete_account(self):
         u = self._require_user()
