@@ -17,7 +17,12 @@ import db
 import email_send
 import tokens
 
-_PBKDF_ROUNDS = 200_000
+# OWASP (2024) recommends >= 600,000 iterations for PBKDF2-HMAC-SHA256. Hashes are
+# stored self-describing ("pbkdf2_sha256$<rounds>$<hex>") so the iteration count
+# travels with each hash and can be raised later without locking anyone out.
+_PBKDF_ROUNDS = 600_000
+_LEGACY_ROUNDS = 200_000   # bare-hex hashes written before the versioned format
+_PBKDF_ALGO = "pbkdf2_sha256"
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
@@ -29,14 +34,51 @@ class AuthError(Exception):
 
 
 # ---------- password hashing ----------
-def _hash(password: str, salt: str) -> str:
+def _pbkdf2(password: str, salt: str, rounds: int) -> str:
     return hashlib.pbkdf2_hmac(
-        "sha256", password.encode(), bytes.fromhex(salt), _PBKDF_ROUNDS
+        "sha256", password.encode(), bytes.fromhex(salt), rounds
     ).hex()
 
 
-def _verify(password: str, salt: str, expected: str) -> bool:
-    return secrets.compare_digest(_hash(password, salt), expected)
+def _hash(password: str, salt: str, rounds: int = _PBKDF_ROUNDS) -> str:
+    """Self-describing hash: 'pbkdf2_sha256$<rounds>$<hex>'."""
+    return f"{_PBKDF_ALGO}${rounds}${_pbkdf2(password, salt, rounds)}"
+
+
+def _parse_hash(stored: str):
+    """Return (rounds, digest_hex, is_legacy) for a stored pw_hash value.
+    Legacy rows are bare hex from before the versioned format existed."""
+    if stored and "$" in stored:
+        _algo, rounds, digest = stored.split("$", 2)
+        return int(rounds), digest, False
+    return _LEGACY_ROUNDS, (stored or ""), True
+
+
+def _verify(password: str, salt: str, stored: str) -> bool:
+    rounds, digest, _legacy = _parse_hash(stored)
+    return secrets.compare_digest(_pbkdf2(password, salt, rounds), digest)
+
+
+def _needs_rehash(stored: str) -> bool:
+    rounds, _digest, is_legacy = _parse_hash(stored)
+    return is_legacy or rounds < _PBKDF_ROUNDS
+
+
+def _maybe_rehash(user_id: int, password: str, stored: str) -> None:
+    """On a successful login with an outdated hash, transparently re-hash the
+    password at current parameters (fresh salt). Never changes the password and
+    never blocks login if the write fails."""
+    if not _needs_rehash(stored):
+        return
+    try:
+        salt = secrets.token_hex(16)
+        with db.cursor() as c:
+            c.execute(
+                "UPDATE users SET pw_salt = ?, pw_hash = ? WHERE id = ?",
+                (salt, _hash(password, salt), user_id),
+            )
+    except Exception as e:  # noqa: BLE001 — a rehash failure must not break login
+        print(f"[caloria] password rehash failed for user {user_id}: {e}")
 
 
 # ---------- account lifecycle ----------
@@ -158,6 +200,7 @@ def login(email: str, password: str) -> dict:
         raise AuthError("Incorrect email or password.", 401)
     if not _is_active(row):
         raise AuthError("This account has been deactivated. Please contact support.", 403)
+    _maybe_rehash(row["id"], password or "", row["pw_hash"])
     return {"token": _new_session(row["id"]), "user": _public_user(row)}
 
 

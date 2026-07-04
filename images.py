@@ -56,7 +56,10 @@ def generate(dish: str) -> str | None:
             body = json.loads(resp.read().decode("utf-8"))
         url = body["data"][0]["url"]
     except (urllib.error.HTTPError, urllib.error.URLError, KeyError, IndexError) as e:
-        raise ImageError(f"Image generation failed: {e}") from e
+        # Keep the underlying detail (may carry OpenAI response text / key hints) in
+        # the server log only; hand the client a generic message.
+        print(f"[caloria] image generation failed: {e}")
+        raise ImageError("Couldn't generate that image right now. Please try again.") from e
 
     db.kv_set(key, url)
     return url

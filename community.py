@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 
 import db
+import imagevalid
 
 # (min_points, level_number, name)
 LEVELS = [
@@ -134,7 +135,7 @@ def update_profile(uid: int, username=None, bio=None, avatar=None, avatar_img=No
         if avatar is not None and str(avatar).strip():
             c.execute("UPDATE member_profiles SET avatar=? WHERE user_id=?", (str(avatar).strip()[:8], uid))
         if avatar_img is not None:
-            img = str(avatar_img) if str(avatar_img).startswith("data:image") else None
+            img = imagevalid.clean_image_data_url(avatar_img)
             c.execute("UPDATE member_profiles SET avatar_img=? WHERE user_id=?", (img, uid))
     return get_profile(uid, uid)
 
@@ -143,6 +144,10 @@ def update_profile(uid: int, username=None, bio=None, avatar=None, avatar_img=No
 def create_post(uid: int, ptype: str, text: str, image=None, image2=None) -> int:
     _ensure()
     ptype = ptype if ptype in POST_TYPES else "win"
+    # Only store properly-formatted image data URLs; drop anything else (never
+    # persist arbitrary/oversized/scriptable strings in an image field).
+    image = imagevalid.clean_image_data_url(image)
+    image2 = imagevalid.clean_image_data_url(image2)
     with db.cursor() as c:
         c.execute(
             "INSERT INTO posts (user_id, type, text, image, image2) VALUES (?,?,?,?,?)",

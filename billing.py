@@ -42,10 +42,12 @@ def _stripe(path: str, params: dict = None, method: str = "POST") -> dict:
         with urllib.request.urlopen(req, timeout=30) as resp:
             return json.loads(resp.read().decode())
     except urllib.error.HTTPError as e:
-        msg = e.read().decode("utf-8", "ignore")[:300]
-        raise BillingError(f"Stripe error {e.code}: {msg}") from e
+        detail = e.read().decode("utf-8", "ignore")[:300]
+        print(f"[caloria] Stripe API error {e.code}: {detail}")   # detail stays server-side
+        raise BillingError("Payment processing is temporarily unavailable. Please try again.") from e
     except urllib.error.URLError as e:
-        raise BillingError(f"Could not reach Stripe: {e.reason}") from e
+        print(f"[caloria] Stripe unreachable: {e.reason}")
+        raise BillingError("Payment processing is temporarily unavailable. Please try again.") from e
 
 
 def _ensure_price(interval: str) -> str:

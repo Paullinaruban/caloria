@@ -30,6 +30,7 @@ import community
 import config
 import db
 import images
+import imagevalid
 import learning
 import mealplan
 import pipeline
@@ -61,6 +62,11 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Vary", "Origin")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+        # Hardening headers on every API response (JSON API — no framing, no sniffing).
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Cache-Control", "no-store")
 
     def _client_ip(self) -> str:
         """Caller IP — trusts X-Forwarded-For only when explicitly behind a proxy."""
@@ -93,7 +99,15 @@ class Handler(BaseHTTPRequestHandler):
 
     def _json_body(self):
         raw = self._raw_body()
-        return json.loads(raw.decode("utf-8")) if raw else {}
+        if not raw:
+            return {}
+        parsed = json.loads(raw.decode("utf-8"))
+        # Every handler treats the body as a JSON object; a non-dict (list, string,
+        # number, null) would raise AttributeError on .get() further down. Reject it
+        # here so do_POST turns it into a clean 400 instead of a dropped connection.
+        if not isinstance(parsed, dict):
+            raise ValueError("JSON body must be an object")
+        return parsed
 
     def _user(self):
         """Return the authenticated user row, or None."""
@@ -129,6 +143,39 @@ class Handler(BaseHTTPRequestHandler):
         })
         return False
 
+    # Endpoints reachable WITHOUT an active subscription. Everything else requires
+    # active Premium (enforced centrally in every dispatcher below). This list is
+    # exactly: signup, login, logout, email verification, password reset, Stripe
+    # checkout/webhook/portal — plus the read-only infra the app needs to render
+    # the subscription screen itself (health, config, the user's own /api/me and
+    # billing status).
+    _PUBLIC_PATHS = frozenset({
+        "/api/health", "/api/config", "/api/me",
+        "/api/auth/signup", "/api/auth/login", "/api/auth/logout",
+        "/api/auth/verify-code", "/api/auth/resend",
+        "/api/auth/forgot", "/api/auth/reset",
+        "/api/billing/checkout", "/api/billing/portal",
+        "/api/billing/webhook", "/api/billing/status",
+    })
+
+    def _subscription_gate(self, path) -> bool:
+        """Central enforcement: every non-public endpoint requires an authenticated
+        user with an ACTIVE Premium subscription. Returns True to proceed; otherwise
+        sends 401 (not signed in) or 402 (subscription required) and returns False."""
+        if path in self._PUBLIC_PATHS:
+            return True
+        u = self._user()
+        if not u:
+            self._send(401, {"error": "Please sign in.", "auth": True})
+            return False
+        if not auth.is_premium(u):
+            self._send(402, {
+                "error": "An active Caloria subscription is required.",
+                "subscription_required": True, "upgrade": True,
+            })
+            return False
+        return True
+
     def _require_verified(self, u) -> bool:
         """Block unverified accounts from cost-bearing features. Returns True if OK."""
         if not config.REQUIRE_EMAIL_VERIFICATION or auth.is_verified(u):
@@ -151,6 +198,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = urlparse(self.path).path
+        if not self._subscription_gate(path):
+            return
         if path == "/api/health":
             return self._send(200, {"ok": True})
         if path == "/api/config":
@@ -304,6 +353,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_DELETE(self):
         path = urlparse(self.path).path
+        if not self._subscription_gate(path):
+            return
         if path == "/api/meals":
             return self._delete_meal()
         if path == "/api/me":
@@ -390,6 +441,8 @@ class Handler(BaseHTTPRequestHandler):
         }
         handler = routes.get(path)
         if handler:
+            if not self._subscription_gate(path):
+                return
             return handler(data)
         return self._send(404, {"error": "not found"})
 
@@ -540,7 +593,7 @@ class Handler(BaseHTTPRequestHandler):
                          "Please try again in a little while."
             })
         image = data.get("image", "")
-        if not isinstance(image, str) or not image.startswith("data:image"):
+        if not imagevalid.is_valid_image_data_url(image):
             return self._send(400, {"error": "expected { image: <data URL> }"})
         if not config.openai_ready():
             # AI vision not configured — fail cleanly and never leak provider details.
@@ -648,7 +701,8 @@ class Handler(BaseHTTPRequestHandler):
         try:
             plan = mealplan.generate_plan(targets, modes, exclusions=exclusions, offset=offset)
         except Exception as e:  # noqa: BLE001
-            return self._send(503, {"error": str(e)})
+            print(f"[caloria] mealplan failed for user {u['id']}: {e}")
+            return self._send(503, {"error": "Couldn't build your meal plan right now. Please try again."})
         plan["basic"] = basic
         self._send(200, plan)
 
@@ -669,7 +723,8 @@ class Handler(BaseHTTPRequestHandler):
                 str(data.get("avoid", "")),
             )
         except Exception as e:  # noqa: BLE001
-            return self._send(503, {"error": str(e)})
+            print(f"[caloria] meal regen failed for user {u['id']}: {e}")
+            return self._send(503, {"error": "Couldn't regenerate that meal right now. Please try again."})
         self._send(200, {"meal": meal})
 
     def _mealimage(self, data):
@@ -709,7 +764,8 @@ class Handler(BaseHTTPRequestHandler):
             plan = workout.generate_one(u["id"], category, goal=goal,
                                         equipment=equipment, duration=duration, level=level)
         except Exception as e:  # noqa: BLE001
-            return self._send(503, {"error": str(e)})
+            print(f"[caloria] workout gen failed for user {u['id']}: {e}")
+            return self._send(503, {"error": "Couldn't build your workout right now. Please try again."})
         self._send(200, {"plan": plan})
 
     def _workout_active(self):
@@ -750,7 +806,8 @@ class Handler(BaseHTTPRequestHandler):
         try:
             answer = coach.reply(u["id"], data.get("message", ""), profile)
         except Exception as e:  # noqa: BLE001
-            return self._send(503, {"error": str(e)})
+            print(f"[caloria] coach failed for user {u['id']}: {e}")   # detail stays server-side
+            return self._send(503, {"error": "The coach is unavailable right now. Please try again."})
         usage.record(u["id"], "coach", email=u["email"], plan=u["plan"], is_admin=admin)
         self._send(200, {"reply": answer})
 

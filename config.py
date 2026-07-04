@@ -82,8 +82,12 @@ TURNSTILE_SECRET = os.environ.get("TURNSTILE_SECRET", "").strip()
 
 # --- Sessions / CORS / proxy ---
 SESSION_TTL_DAYS = int(os.environ.get("SESSION_TTL_DAYS", "30"))
-# Lock CORS to your frontend origin in production (e.g. https://app.caloria.com).
-ALLOWED_ORIGIN = os.environ.get("ALLOWED_ORIGIN", "*").strip()
+# Lock CORS to your frontend origin. When ALLOWED_ORIGIN isn't set explicitly we
+# default to APP_BASE_URL (your production site) rather than a wildcard, so a
+# correctly-configured deployment is locked to the real domain out of the box.
+# Set ALLOWED_ORIGIN="*" explicitly only for local/dev use.
+ALLOWED_ORIGIN = (os.environ.get("ALLOWED_ORIGIN", "").strip()
+                  or APP_BASE_URL.rstrip("/"))
 # Trust X-Forwarded-For (only enable behind a reverse proxy you control).
 TRUST_PROXY = os.environ.get("TRUST_PROXY", "false").lower() == "true"
 
