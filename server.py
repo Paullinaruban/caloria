@@ -158,6 +158,15 @@ class Handler(BaseHTTPRequestHandler):
         "/api/billing/webhook", "/api/billing/status",
     })
 
+    # Signed-in pre-paywall funnel: reachable by an AUTHENTICATED user who has not
+    # yet subscribed. This is the onboarding step (saves the questionnaire profile
+    # and computes calorie/macro targets so we can show the personalized results +
+    # conversion screen BEFORE asking for payment). It unlocks NO premium feature —
+    # every real product endpoint below still requires an active subscription.
+    _FUNNEL_PATHS = frozenset({
+        "/api/onboarding",
+    })
+
     def _subscription_gate(self, path) -> bool:
         """Central enforcement: every non-public endpoint requires an authenticated
         user with an ACTIVE Premium subscription. Returns True to proceed; otherwise
@@ -168,6 +177,10 @@ class Handler(BaseHTTPRequestHandler):
         if not u:
             self._send(401, {"error": "Please sign in.", "auth": True})
             return False
+        # Onboarding funnel: authentication is enough (no premium yet). Real premium
+        # features are NOT in this set and remain gated below.
+        if path in self._FUNNEL_PATHS:
+            return True
         if not auth.is_premium(u):
             self._send(402, {
                 "error": "An active Caloria subscription is required.",
