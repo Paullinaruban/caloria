@@ -199,6 +199,50 @@ def init_db() -> None:
                 PRIMARY KEY (user_id, type, period)
             )"""
         )
+        # --- Caloria Club: Founding Members + referrals (see club.py) ---
+        c.execute(
+            """CREATE TABLE IF NOT EXISTS club_members (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                email          TEXT UNIQUE NOT NULL,
+                referral_code  TEXT UNIQUE NOT NULL,
+                referred_by    TEXT,                         -- referrer's code
+                referral_count INTEGER NOT NULL DEFAULT 0,
+                welcome_sent   INTEGER NOT NULL DEFAULT 0,
+                created_at     TEXT DEFAULT CURRENT_TIMESTAMP
+            )"""
+        )
+        # Ranking index — position lookups stay fast as the club grows.
+        c.execute("CREATE INDEX IF NOT EXISTS idx_club_rank "
+                  "ON club_members(referral_count DESC, id ASC)")
+        # Founding-member onboarding answers (goal / struggle / excited feature),
+        # captured right after the email step and shown in the admin panel.
+        _add_column(c, "club_members", "goal", "TEXT")
+        _add_column(c, "club_members", "struggle", "TEXT")
+        _add_column(c, "club_members", "excited", "TEXT")
+        # One-click unsubscribe (required for marketing broadcasts).
+        _add_column(c, "club_members", "unsubscribed", "INTEGER NOT NULL DEFAULT 0")
+        # Canonical address (plus-tags stripped, gmail dots removed) — dedupes
+        # referral farming via girl+1@gmail.com / girl+2@gmail.com aliases.
+        # Backfilled by club.init() at startup.
+        _add_column(c, "club_members", "canonical", "TEXT")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_club_canonical ON club_members(canonical)")
+        # Founder-update broadcast log (progress + history for the admin panel).
+        c.execute(
+            """CREATE TABLE IF NOT EXISTS club_updates (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                subject    TEXT NOT NULL,
+                body       TEXT NOT NULL,
+                total      INTEGER NOT NULL DEFAULT 0,
+                sent       INTEGER NOT NULL DEFAULT 0,
+                failed     INTEGER NOT NULL DEFAULT 0,
+                status     TEXT NOT NULL DEFAULT 'sending',  -- sending | interrupted | done
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )"""
+        )
+        # Broadcast hardening: audience segment + resume watermark. A campaign
+        # that dies mid-send resumes from last_member_id — no duplicate emails.
+        _add_column(c, "club_updates", "audience", "TEXT NOT NULL DEFAULT 'all'")
+        _add_column(c, "club_updates", "last_member_id", "INTEGER NOT NULL DEFAULT 0")
 
 
 def kv_get(key: str):

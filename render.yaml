@@ -1,54 +1,59 @@
 # Render Blueprint for the Caloria backend.
 #
-# ⚙️  CURRENT MODE: FREE ($0/month) — great for testing/QA.
-#     ⚠️  On the free plan the database is EPHEMERAL: all data (accounts, workouts,
-#         posts, AI logs, subscription status) is WIPED whenever the service sleeps
-#         (~15 min idle), redeploys, or restarts. The service also cold-starts
-#         (~50s) after idle, and scheduled reminder emails won't fire reliably.
-#         FINE for testing. NOT for real users.
+# ⚙️  CURRENT MODE: PRODUCTION (~$7.25/mo)
+#     • plan: starter        → always on, no cold starts, no data wipes
+#     • persistent disk      → the database (accounts + Founding Members) survives
+#                              restarts, redeploys and deploys
+#     • CALORIA_DB on disk   → SQLite lives at /data/caloria.db
 #
-# 🚀  TO GO PRODUCTION (persistent data, ~$7.25/mo) — make 3 edits below:
-#       1) change   plan: free   →   plan: starter
-#       2) uncomment the whole `disk:` block
-#       3) uncomment the `CALORIA_DB` env var
+#     Production domain: https://caloriaclub.com (Netlify frontend).
+#     CORS is locked to that origin; all email links are built from APP_BASE_URL.
+#
+#     Secrets (set once in the Render dashboard → Environment tab):
+#       RESEND_API_KEY        -> re_...        (emails — REQUIRED for launch)
+#       OPENAI_API_KEY        -> sk-...        (AI scan + coach)
+#       STRIPE_SECRET_KEY     -> sk_live_...
+#       STRIPE_WEBHOOK_SECRET -> whsec_...
+#       (do NOT set DEV_UNLIMITED in production)
 services:
   - type: web
     name: caloria-api
     runtime: python
-    plan: free                       # ← change to `starter` for production
+    plan: starter
     buildCommand: ""
     startCommand: python server.py
     healthCheckPath: /api/health
 
-    # --- PRODUCTION persistence: uncomment this block (needs plan: starter) ---
-    # disk:
-    #   name: caloria-data
-    #   mountPath: /data
-    #   sizeGB: 1
+    disk:
+      name: caloria-data
+      mountPath: /data
+      sizeGB: 1
 
     envVars:
-      # --- PRODUCTION persistence: uncomment so the DB lives on the disk above ---
-      # - key: CALORIA_DB
-      #   value: /data/caloria.db
+      - key: CALORIA_DB
+        value: /data/caloria.db
       - key: PYTHON_VERSION
         value: "3.11.9"
-      # Enforce email verification (requires RESEND_API_KEY + EMAIL_FROM below).
+      # Production domain — referral links, email buttons and founder-status
+      # links are all generated from this. CORS locks to the same origin.
+      - key: APP_BASE_URL
+        value: "https://caloriaclub.com"
+      - key: ALLOWED_ORIGIN
+        value: "https://caloriaclub.com"
+      # Human sender + reply-able address: "noreply@" is a mild spam signal and
+      # kills engagement; any address on the verified domain may send via Resend.
+      - key: EMAIL_FROM
+        value: "Paullina from Caloria <hello@caloriaclub.com>"
+      # Replies land in a real inbox (personal touch + deliverability signal).
+      - key: EMAIL_REPLY_TO
+        value: "polinaryzova8@gmail.com"
+      # Enforce email verification (requires RESEND_API_KEY above).
       - key: REQUIRE_EMAIL_VERIFICATION
         value: "true"
-      - key: ALLOWED_ORIGIN
-        value: "*"
       - key: APP_SECRET
         generateValue: true
-      # Admin allow-list — these emails can open /admin (the analytics dashboard).
+      # Admin allow-list — these emails can open /admin (dashboard + Caloria Club).
       - key: ADMIN_EMAILS
         value: "polinaryzova8@gmail.com"
       - key: EMAIL_RETENTION_ENABLED
         value: "true"
-      # ---- Add these in the Render dashboard (Environment tab) ----
-      #   OPENAI_API_KEY        -> sk-...        (AI scan + coach)
-      #   RESEND_API_KEY        -> re_...        (emails)
-      #   EMAIL_FROM            -> Caloria <noreply@caloriaclub.com>
-      #   APP_BASE_URL          -> your Netlify site URL
-      #   STRIPE_SECRET_KEY     -> sk_live_... / sk_test_...
-      #   STRIPE_WEBHOOK_SECRET -> whsec_...
-      #   (do NOT set DEV_UNLIMITED in production)

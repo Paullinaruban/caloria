@@ -50,22 +50,49 @@ def _stripe(path: str, params: dict = None, method: str = "POST") -> dict:
         raise BillingError("Payment processing is temporarily unavailable. Please try again.") from e
 
 
-def _ensure_price(interval: str) -> str:
-    """Return a Stripe price id for 'monthly' or 'yearly', creating if needed."""
+def _key_mode() -> str:
+    """'live' or 'test' for the active secret key. Auto-created product/price ids
+    are cached per-mode so switching STRIPE_SECRET_KEY from test to live never
+    reuses the test-mode ids (which Stripe rejects under a live key)."""
+    return "live" if config.STRIPE_SECRET_KEY.startswith("sk_live") else "test"
+
+
+def _ensure_price(interval: str, currency: str = "USD") -> str:
+    """Return a Stripe price id for the interval in the requested currency.
+
+    Resolution order: localized price id for the currency -> USD price id ->
+    legacy single-currency env var -> auto-created USD price. This means a
+    currency without a configured price simply falls back to USD.
+    """
+    currency = config.normalize_currency(currency)
+
+    # 1) localized price id for the requested currency (e.g. THB/EUR/GBP)
+    pid = config.stripe_price_id(interval, currency)
+    if pid:
+        return pid
+    # 2) fall back to the USD localized price id
+    pid = config.stripe_price_id(interval, "USD")
+    if pid:
+        return pid
+    # 3) legacy single-currency env var (backward compatible)
     if interval == "monthly" and config.STRIPE_PRICE_MONTHLY:
         return config.STRIPE_PRICE_MONTHLY
     if interval == "yearly" and config.STRIPE_PRICE_YEARLY:
         return config.STRIPE_PRICE_YEARLY
 
-    cached = db.kv_get(f"stripe_price_{interval}")
+    # 4) auto-create a USD price. Cache keys are scoped to the key mode (live/test)
+    # so a test->live switch creates fresh live objects instead of reusing
+    # incompatible test-mode ids.
+    mode = _key_mode()
+    cached = db.kv_get(f"stripe_price_{interval}_{mode}")
     if cached:
         return cached
 
-    product_id = db.kv_get("stripe_product")
+    product_id = db.kv_get(f"stripe_product_{mode}")
     if not product_id:
         product = _stripe("products", {"name": "Caloria Premium"})
         product_id = product["id"]
-        db.kv_set("stripe_product", product_id)
+        db.kv_set(f"stripe_product_{mode}", product_id)
 
     amount = 1999 if interval == "monthly" else 9900
     recur = "month" if interval == "monthly" else "year"
@@ -78,14 +105,16 @@ def _ensure_price(interval: str) -> str:
             "recurring[interval]": recur,
         },
     )
-    db.kv_set(f"stripe_price_{interval}", price["id"])
+    db.kv_set(f"stripe_price_{interval}_{mode}", price["id"])
     return price["id"]
 
 
-def create_checkout(user, interval: str) -> str:
+def create_checkout(user, interval: str, currency: str = "USD") -> str:
     if interval not in ("monthly", "yearly"):
         raise BillingError("Invalid plan interval.")
-    price_id = _ensure_price(interval)
+    currency = config.normalize_currency(currency)
+    price_id = _ensure_price(interval, currency)
+    print(f"[caloria] checkout: mode={_key_mode()} interval={interval} currency={currency} price={price_id}")
     params = {
         "mode": "subscription",
         "line_items[0][price]": price_id,

@@ -48,10 +48,82 @@ USDA_DATA_TYPES = ["Foundation", "SR Legacy"]  # reliable per-100g profiles
 # --- Stripe subscriptions ---
 STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY", "").strip()
 STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "").strip()
-STRIPE_PRICE_MONTHLY = os.environ.get("STRIPE_PRICE_MONTHLY", "").strip()  # price_...
+STRIPE_PRICE_MONTHLY = os.environ.get("STRIPE_PRICE_MONTHLY", "").strip()  # price_... (legacy, USD)
 STRIPE_PRICE_YEARLY = os.environ.get("STRIPE_PRICE_YEARLY", "").strip()
 PRICE_MONTHLY_DISPLAY = "$19.99"
 PRICE_YEARLY_DISPLAY = "$99"
+
+# --- Multi-currency pricing (USD, THB, EUR, GBP) ---
+# Localized Stripe Price ids per currency + interval. Create these prices in your
+# Stripe dashboard and paste their ids here. A currency with a missing price id
+# is simply not offered — checkout always falls back to USD.
+SUPPORTED_CURRENCIES = ("USD", "THB", "EUR", "GBP")
+
+STRIPE_PRICE_IDS = {
+    ("monthly", "USD"): os.environ.get("STRIPE_PRICE_MONTHLY_USD", "").strip(),
+    ("yearly",  "USD"): os.environ.get("STRIPE_PRICE_YEARLY_USD", "").strip(),
+    ("monthly", "THB"): os.environ.get("STRIPE_PRICE_MONTHLY_THB", "").strip(),
+    ("yearly",  "THB"): os.environ.get("STRIPE_PRICE_YEARLY_THB", "").strip(),
+    ("monthly", "EUR"): os.environ.get("STRIPE_PRICE_MONTHLY_EUR", "").strip(),
+    ("yearly",  "EUR"): os.environ.get("STRIPE_PRICE_YEARLY_EUR", "").strip(),
+    ("monthly", "GBP"): os.environ.get("STRIPE_PRICE_MONTHLY_GBP", "").strip(),
+    ("yearly",  "GBP"): os.environ.get("STRIPE_PRICE_YEARLY_GBP", "").strip(),
+}
+
+# Display strings shown BEFORE checkout (the real charge comes from the Stripe
+# Price object). Overridable via env so they match what you configured in Stripe,
+# e.g. PRICE_MONTHLY_THB_DISPLAY=฿699.
+_CURRENCY_DISPLAY_DEFAULTS = {
+    "USD": ("$", "$19.99", "$99"),
+    "THB": ("฿", "฿699",   "฿3,499"),
+    "EUR": ("€", "€19.99", "€99"),
+    "GBP": ("£", "£16.99", "£84"),
+}
+
+# Rough country -> default-currency map (used when the client sends a country
+# instead of an explicit currency preference).
+_COUNTRY_CURRENCY = {
+    "TH": "THB", "GB": "GBP",
+    "AT": "EUR", "BE": "EUR", "CY": "EUR", "EE": "EUR", "FI": "EUR", "FR": "EUR",
+    "DE": "EUR", "GR": "EUR", "IE": "EUR", "IT": "EUR", "LV": "EUR", "LT": "EUR",
+    "LU": "EUR", "MT": "EUR", "NL": "EUR", "PT": "EUR", "SK": "EUR", "SI": "EUR", "ES": "EUR",
+}
+
+
+def normalize_currency(currency: str) -> str:
+    c = (currency or "").upper()
+    return c if c in SUPPORTED_CURRENCIES else "USD"
+
+
+def stripe_price_id(interval: str, currency: str) -> str:
+    return STRIPE_PRICE_IDS.get((interval, normalize_currency(currency)), "")
+
+
+def currency_for_country(country: str) -> str:
+    return _COUNTRY_CURRENCY.get((country or "").upper(), "USD")
+
+
+def currency_display() -> dict:
+    """Per-currency symbol + monthly/yearly display strings for the UI."""
+    out = {}
+    for cur, (symbol, monthly, yearly) in _CURRENCY_DISPLAY_DEFAULTS.items():
+        out[cur] = {
+            "symbol": symbol,
+            "monthly": os.environ.get(f"PRICE_MONTHLY_{cur}_DISPLAY", monthly).strip(),
+            "yearly": os.environ.get(f"PRICE_YEARLY_{cur}_DISPLAY", yearly).strip(),
+        }
+    return out
+
+
+def available_currencies() -> list:
+    """USD is always offered (it is the universal fallback). THB/EUR/GBP appear
+    only when BOTH their monthly & yearly price ids are set, so the displayed
+    currency always matches what the customer is actually charged."""
+    avail = ["USD"]
+    for cur in ("THB", "EUR", "GBP"):
+        if stripe_price_id("monthly", cur) and stripe_price_id("yearly", cur):
+            avail.append(cur)
+    return avail
 # Revenue per active subscriber used for MRR in the admin analytics.
 MRR_PER_SUBSCRIBER = float(os.environ.get("MRR_PER_SUBSCRIBER", "19.99"))
 APP_BASE_URL = os.environ.get("APP_BASE_URL", "http://localhost:8000").strip()
@@ -60,6 +132,9 @@ APP_BASE_URL = os.environ.get("APP_BASE_URL", "http://localhost:8000").strip()
 # https://resend.com/api-keys — used for email verification & password reset.
 RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "").strip()
 EMAIL_FROM = os.environ.get("EMAIL_FROM", "Caloria <onboarding@resend.dev>").strip()
+# Optional Reply-To — a real, monitored inbox. Replies to a noreply@ sender
+# bounce; a working Reply-To both feels personal and helps deliverability.
+EMAIL_REPLY_TO = os.environ.get("EMAIL_REPLY_TO", "").strip()
 # Version of the Terms/Privacy a user accepts at signup (for consent evidence).
 POLICY_VERSION = os.environ.get("POLICY_VERSION", "2026-06-17").strip()
 EMAIL_TIMEOUT = int(os.environ.get("EMAIL_TIMEOUT", "15"))

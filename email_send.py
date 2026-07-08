@@ -10,21 +10,29 @@ the raw token anywhere except the one-time link.
 from __future__ import annotations
 
 import json
+import time
 import urllib.error
 import urllib.request
 
 import config
 
 _RESEND_URL = "https://api.resend.com/emails"
+# Outbound email is retried on transient failures. Without this, a cold DNS/TLS
+# handshake or a momentary blip through Resend's Cloudflare front would fail the
+# FIRST send silently, so the code only arrived once the user requested it again.
+_SEND_ATTEMPTS = 3
+_RETRY_BACKOFF = 0.6  # seconds, multiplied by the attempt number
 
 
 class EmailError(RuntimeError):
     pass
 
 
-def _send(to: str, subject: str, html: str, text: str) -> str | None:
+def _send(to: str, subject: str, html: str, text: str,
+          headers: dict | None = None) -> str | None:
     """Send one email via Resend. Returns the Resend message id on success (and
-    logs it for a delivery audit trail), or None in the dev/console fallback."""
+    logs it for a delivery audit trail), or None in the dev/console fallback.
+    `headers` adds custom SMTP headers (e.g. List-Unsubscribe for bulk sends)."""
     if not config.email_ready():
         # Dev fallback — surface the message so the flow is testable without a key.
         print(f"[caloria][EMAIL:dev] to={to} subject={subject!r}\n{text}\n")
@@ -36,6 +44,10 @@ def _send(to: str, subject: str, html: str, text: str) -> str | None:
         "html": html,
         "text": text,
     }
+    if config.EMAIL_REPLY_TO:
+        payload["reply_to"] = [config.EMAIL_REPLY_TO]
+    if headers:
+        payload["headers"] = headers
     req = urllib.request.Request(
         _RESEND_URL,
         data=json.dumps(payload).encode("utf-8"),
@@ -48,14 +60,26 @@ def _send(to: str, subject: str, html: str, text: str) -> str | None:
         },
         method="POST",
     )
-    try:
-        resp = urllib.request.urlopen(req, timeout=config.EMAIL_TIMEOUT)
-        body = resp.read().decode("utf-8", "ignore")
-    except urllib.error.HTTPError as e:
-        detail = e.read().decode("utf-8", "ignore")[:200]
-        raise EmailError(f"Email provider error {e.code}: {detail}") from e
-    except urllib.error.URLError as e:
-        raise EmailError(f"Could not reach email provider: {e.reason}") from e
+    body = None
+    last_err = None
+    for attempt in range(_SEND_ATTEMPTS):
+        try:
+            resp = urllib.request.urlopen(req, timeout=config.EMAIL_TIMEOUT)
+            body = resp.read().decode("utf-8", "ignore")
+            break
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode("utf-8", "ignore")[:200]
+            # 4xx (bad key, invalid address, …) are permanent — fail fast. Only
+            # 429 and 5xx are worth retrying.
+            if e.code < 500 and e.code != 429:
+                raise EmailError(f"Email provider error {e.code}: {detail}") from e
+            last_err = EmailError(f"Email provider error {e.code}: {detail}")
+        except urllib.error.URLError as e:  # DNS/TLS/connection reset/timeout
+            last_err = EmailError(f"Could not reach email provider: {e.reason}")
+        if attempt < _SEND_ATTEMPTS - 1:
+            time.sleep(_RETRY_BACKOFF * (attempt + 1))
+    if body is None:
+        raise last_err or EmailError("Could not reach email provider.")
     try:
         mid = json.loads(body).get("id")
     except (ValueError, AttributeError):

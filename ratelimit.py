@@ -24,6 +24,11 @@ LIMITS = {
     "forgot": (4, 3600),      # 4 reset requests/hour/IP
     "resend": (4, 3600),      # 4 verification resends/hour/IP
     "verify_code": (15, 900), # 15 code attempts / 15 min / IP (brute-force guard)
+    # Caloria Club: launch traffic arrives from TikTok/Instagram in-app browsers,
+    # where whole mobile carriers share a handful of NAT'd IPs — per-IP limits
+    # must leave real headroom. Duplicate emails are deduped regardless.
+    "club_join": (30, 3600),     # 30 joins/hour/IP
+    "club_answers": (120, 3600), # 3 taps per join × the same shared-IP crowd
 }
 
 

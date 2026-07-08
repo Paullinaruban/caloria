@@ -25,6 +25,7 @@ import notifications
 import ritual
 import threading
 import billing
+import club
 import coach
 import community
 import config
@@ -67,6 +68,17 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("X-Frame-Options", "DENY")
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("Cache-Control", "no-store")
+
+    def _send_html(self, code, html):
+        body = html.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
 
     def _client_ip(self) -> str:
         """Caller IP — trusts X-Forwarded-For only when explicitly behind a proxy."""
@@ -156,6 +168,10 @@ class Handler(BaseHTTPRequestHandler):
         "/api/auth/forgot", "/api/auth/reset",
         "/api/billing/checkout", "/api/billing/portal",
         "/api/billing/webhook", "/api/billing/status",
+        # Caloria Club (founding members) — public by design: visitors join with
+        # just an email, before they have any account. Rate-limited + deduped.
+        "/api/club/join", "/api/club/answers", "/api/club/status", "/api/club/stats",
+        "/api/club/unsubscribe",
     })
 
     # Signed-in pre-paywall funnel: reachable by an AUTHENTICATED user who has not
@@ -225,6 +241,11 @@ class Handler(BaseHTTPRequestHandler):
                 "free_scan_limit": config.FREE_SCAN_LIMIT,
                 "price_monthly": config.PRICE_MONTHLY_DISPLAY,
                 "price_yearly": config.PRICE_YEARLY_DISPLAY,
+                # Multi-currency: per-currency display strings + which currencies
+                # are actually offered (USD always; others when their prices exist).
+                "currencies": config.currency_display(),
+                "available_currencies": config.available_currencies(),
+                "default_currency": "USD",
                 "trial_days": config.TRIAL_DAYS,
                 # Public bits the frontend needs (site key is meant to be public).
                 "turnstile_site_key": config.TURNSTILE_SITE_KEY,
@@ -328,6 +349,83 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, admin.user_detail(email))
             except ValueError as e:
                 return self._send(404, {"error": str(e)})
+        # ---- Caloria Club (founding members) ----
+        if path == "/api/club/stats":
+            return self._send(200, club.stats())      # public — powers social proof
+        if path == "/api/club/unsubscribe":
+            # One-click unsubscribe from email footers — returns a branded page.
+            qs = parse_qs(urlparse(self.path).query)
+            ok = club.unsubscribe((qs.get("e") or [""])[0], (qs.get("t") or [""])[0])
+            page = club.UNSUBSCRIBE_PAGE.replace(
+                "%HEADING%", "You’ve been unsubscribed. 🤍" if ok else "This link didn’t work."
+            ).replace(
+                "%BODY%",
+                "You won’t receive founder updates anymore. Your Founding Member place "
+                "is still yours — you can come back any time." if ok else
+                "Please use the unsubscribe link from the bottom of a Caloria email.",
+            )
+            return self._send_html(200 if ok else 400, page)
+        if path == "/api/club/status":
+            qs = parse_qs(urlparse(self.path).query)
+            st = club.status_by_code((qs.get("code") or [""])[0])
+            if not st:
+                return self._send(404, {"error": "We couldn't find that membership."})
+            return self._send(200, st)
+        if path == "/api/club/admin/overview":
+            if not self._require_admin():
+                return
+            return self._send(200, club.overview())
+        if path == "/api/club/admin/members":
+            if not self._require_admin():
+                return
+            qs = parse_qs(urlparse(self.path).query)
+
+            def _int(key, default=0):
+                try:
+                    return int((qs.get(key) or [default])[0])
+                except (TypeError, ValueError):
+                    return default
+            return self._send(200, {"members": club.members(
+                (qs.get("q") or [""])[0],
+                _int("limit", 200),
+                since_days=_int("since"),
+                min_referrals=_int("min_ref"),
+                invited_only=(qs.get("invited") or ["0"])[0] == "1",
+            )})
+        if path == "/api/club/admin/audience-count":
+            if not self._require_admin():
+                return
+            qs = parse_qs(urlparse(self.path).query)
+            return self._send(200, club.audience_count((qs.get("audience") or ["all"])[0]))
+        if path == "/api/club/admin/health":
+            # Launch-control status card: API (reaching this = up), database
+            # (live read+write probe), email service (config + today's volume).
+            if not self._require_admin():
+                return
+            db_ok, members = True, 0
+            try:
+                with db.cursor() as c:
+                    members = c.execute("SELECT COUNT(*) AS n FROM club_members").fetchone()["n"]
+                db.kv_set("club_health_probe", "ok")   # proves the disk is writable
+            except Exception as e:  # noqa: BLE001
+                db_ok = False
+                print(f"[caloria][club] health probe failed: {e}")
+            return self._send(200, {
+                "api": True,
+                "db": db_ok,
+                "db_path": config.DB_PATH,
+                "members": members,
+                "email_configured": config.email_ready(),
+                "emails_sent_today": club.emails_sent_today(),
+            })
+        if path == "/api/club/admin/leaderboard":
+            if not self._require_admin():
+                return
+            return self._send(200, {"leaderboard": club.leaderboard()})
+        if path == "/api/club/admin/updates":
+            if not self._require_admin():
+                return
+            return self._send(200, {"updates": club.updates()})
         # ---- community (Supermodel Wellness Club) ----
         if path == "/api/community/stats":
             return self._send(200, community.stats())  # public — powers social proof
@@ -414,6 +512,13 @@ class Handler(BaseHTTPRequestHandler):
         # Webhook needs the raw body for signature verification.
         if path == "/api/billing/webhook":
             return self._webhook()
+        # RFC 8058 one-click unsubscribe: mail clients POST (form-encoded, not
+        # JSON) to the same signed URL from the List-Unsubscribe header.
+        if path == "/api/club/unsubscribe":
+            self._raw_body()  # drain the request body
+            qs = parse_qs(urlparse(self.path).query)
+            ok = club.unsubscribe((qs.get("e") or [""])[0], (qs.get("t") or [""])[0])
+            return self._send(200 if ok else 400, {"ok": ok})
         try:
             data = self._json_body()
         except (json.JSONDecodeError, ValueError):
@@ -448,6 +553,13 @@ class Handler(BaseHTTPRequestHandler):
             "/api/workout/complete": self._workout_complete,
             "/api/billing/checkout": self._checkout,
             "/api/billing/portal": self._billing_portal,
+            "/api/club/join": self._club_join,
+            "/api/club/answers": self._club_answers,
+            "/api/club/admin/send-update": self._club_send_update,
+            "/api/club/admin/test-update": self._club_test_update,
+            "/api/club/admin/preview-update": self._club_preview_update,
+            "/api/club/admin/resume-update": self._club_resume_update,
+            "/api/club/admin/resend-welcomes": self._club_resend_welcomes,
             "/api/admin/override": self._admin_override,
             "/api/admin/user/action": self._admin_user_action,
             "/api/admin/email-test": self._admin_email_test,
@@ -824,6 +936,80 @@ class Handler(BaseHTTPRequestHandler):
         usage.record(u["id"], "coach", email=u["email"], plan=u["plan"], is_admin=admin)
         self._send(200, {"reply": answer})
 
+    # ---- Caloria Club (founding members) ----
+    def _club_join(self, data):
+        if self._rate_limited("club_join", self._client_ip()):
+            return
+        try:
+            res = club.join(str(data.get("email", "")), str(data.get("ref", "")))
+        except club.ClubError as e:
+            return self._send(e.code, {"error": e.message})
+        self._send(200, res)
+
+    def _club_answers(self, data):
+        """Save one or more founding-onboarding answers for a member (by code)."""
+        if self._rate_limited("club_answers", self._client_ip()):
+            return
+        try:
+            res = club.save_answers(str(data.get("code", "")), data)
+        except club.ClubError as e:
+            return self._send(e.code, {"error": e.message})
+        self._send(200, res)
+
+    def _club_send_update(self, data):
+        if not self._require_admin():
+            return
+        try:
+            res = club.send_update(str(data.get("subject", "")), str(data.get("message", "")),
+                                   str(data.get("audience", "all")))
+        except club.ClubError as e:
+            return self._send(e.code, {"error": e.message})
+        self._send(200, res)
+
+    def _club_test_update(self, data):
+        """Send one personalized test email to the signed-in admin only."""
+        u = self._require_admin()
+        if not u:
+            return
+        try:
+            res = club.send_test(str(data.get("subject", "")), str(data.get("message", "")),
+                                 u["email"])
+        except club.ClubError as e:
+            return self._send(e.code, {"error": e.message})
+        except Exception as e:  # noqa: BLE001 — surface provider errors cleanly
+            print(f"[caloria][club] test email failed: {e}")
+            return self._send(503, {"error": "The test email could not be sent. Please try again."})
+        self._send(200, res)
+
+    def _club_preview_update(self, data):
+        if not self._require_admin():
+            return
+        try:
+            res = club.preview_update(str(data.get("subject", "")), str(data.get("message", "")))
+        except club.ClubError as e:
+            return self._send(e.code, {"error": e.message})
+        self._send(200, res)
+
+    def _club_resend_welcomes(self, data):
+        """Re-attempt welcome letters for members who never got one (rate-limit days)."""
+        if not self._require_admin():
+            return
+        try:
+            self._send(200, club.resend_welcomes())
+        except club.ClubError as e:
+            self._send(e.code, {"error": e.message})
+
+    def _club_resume_update(self, data):
+        if not self._require_admin():
+            return
+        try:
+            res = club.resume_update(int(data.get("id", 0)))
+        except club.ClubError as e:
+            return self._send(e.code, {"error": e.message})
+        except (TypeError, ValueError):
+            return self._send(400, {"error": "invalid campaign id"})
+        self._send(200, res)
+
     # ---- admin overrides (owner-only; no code changes needed at runtime) ----
     def _admin_override(self, data):
         if not self._require_admin():
@@ -939,8 +1125,13 @@ class Handler(BaseHTTPRequestHandler):
             return
         if not self._require_verified(u):
             return
+        # Currency preference: explicit `currency`, else derived from `country`,
+        # else USD. billing normalizes/validates and falls back to USD.
+        currency = data.get("currency") or ""
+        if not currency and data.get("country"):
+            currency = config.currency_for_country(data.get("country"))
         try:
-            url = billing.create_checkout(auth.public_user(u), data.get("interval", "monthly"))
+            url = billing.create_checkout(auth.public_user(u), data.get("interval", "monthly"), currency or "USD")
         except billing.BillingError as e:
             return self._send(503, {"error": str(e)})
         self._send(200, {"url": url})
@@ -969,6 +1160,7 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     db.init_db()
     usage.init()
+    club.init()   # backfill canonical emails for pre-existing club members
     # Retention-email scheduler (daemon). Only auto-sends when EMAIL_RETENTION_ENABLED.
     threading.Thread(target=mailer.run_scheduler, daemon=True).start()
     httpd = ThreadingHTTPServer((config.HOST, config.PORT), Handler)
