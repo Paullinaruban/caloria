@@ -347,6 +347,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, admin.user_detail(email))
             except ValueError as e:
                 return self._send(404, {"error": str(e)})
+        if path == "/api/admin/community":
+            if not self._require_admin():
+                return
+            return self._send(200, admin.community_moderation())
         # ---- Caloria Club (founding members) ----
         if path == "/api/club/stats":
             return self._send(200, club.stats())      # public — powers social proof

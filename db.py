@@ -115,6 +115,8 @@ def init_db() -> None:
         _add_column(c, "users", "email_verified", "INTEGER NOT NULL DEFAULT 0")
         _add_column(c, "users", "subscription_status", "TEXT")     # active|trialing|past_due|canceled
         _add_column(c, "users", "stripe_subscription", "TEXT")     # sub_...
+        _add_column(c, "users", "plan_interval", "TEXT")           # monthly|yearly (captured at checkout)
+        _add_column(c, "users", "subscribed_at", "TEXT")           # ISO ts of first paid checkout
         _add_column(c, "users", "active", "INTEGER NOT NULL DEFAULT 1")  # admin can deactivate
         # Founding Member badge (private launch) — permanent once set. See
         # config.FOUNDING_MEMBER_EMAILS and auth.grant_founding_if_invited().

@@ -136,6 +136,10 @@ def create_checkout(user, interval: str, return_base: str = "") -> str:
         "success_url": f"{base}/?checkout=success&session_id={{CHECKOUT_SESSION_ID}}",
         "cancel_url": f"{base}/?checkout=cancel",
         "allow_promotion_codes": "true",
+        # Stamp the billing interval on both the session and the subscription so
+        # the admin dashboard can report monthly vs yearly without extra lookups.
+        "metadata[plan_interval]": interval,
+        "subscription_data[metadata][plan_interval]": interval,
     }
     # Free trial — no charge until the trial ends; cancel anytime before then.
     if config.TRIAL_DAYS > 0:
@@ -165,12 +169,16 @@ def confirm_checkout(user, session_id: str) -> bool:
     paid = (s.get("payment_status") == "paid") or (s.get("status") == "complete")
     if not paid:
         return False
+    interval = (s.get("metadata") or {}).get("plan_interval")
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     with db.cursor() as c:
         c.execute(
             "UPDATE users SET plan='premium', subscription_status='active', "
             "stripe_customer=COALESCE(?, stripe_customer), "
-            "stripe_subscription=COALESCE(?, stripe_subscription) WHERE id=?",
-            (s.get("customer"), s.get("subscription"), user["id"]),
+            "stripe_subscription=COALESCE(?, stripe_subscription), "
+            "plan_interval=COALESCE(?, plan_interval), "
+            "subscribed_at=COALESCE(subscribed_at, ?) WHERE id=?",
+            (s.get("customer"), s.get("subscription"), interval, now, user["id"]),
         )
     _log_event("checkout.confirmed", s.get("customer"), "active", user_id=user["id"])
     return True
@@ -283,11 +291,15 @@ def handle_event(event: dict) -> None:
     if etype == "checkout.session.completed":
         user_id = obj.get("client_reference_id")
         if user_id:
+            interval = (obj.get("metadata") or {}).get("plan_interval")
+            now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
             with db.cursor() as c:
                 c.execute(
                     "UPDATE users SET plan='premium', subscription_status='active', "
-                    "stripe_customer=?, stripe_subscription=? WHERE id=?",
-                    (obj.get("customer"), obj.get("subscription"), int(user_id)),
+                    "stripe_customer=?, stripe_subscription=?, "
+                    "plan_interval=COALESCE(?, plan_interval), "
+                    "subscribed_at=COALESCE(subscribed_at, ?) WHERE id=?",
+                    (obj.get("customer"), obj.get("subscription"), interval, now, int(user_id)),
                 )
 
     elif etype == "customer.subscription.updated":

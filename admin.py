@@ -119,6 +119,9 @@ def user_detail(email: str) -> dict:
         "joined": (r["created_at"] or "")[:10],
         "subscription_status": r["subscription_status"] or "—",
         "stripe_customer": r["stripe_customer"] or None,
+        "stripe_subscription": r["stripe_subscription"] or None,
+        "plan_interval": r["plan_interval"] or None,
+        "subscribed_at": r["subscribed_at"] or None,
         "founding_member": bool(r["founding_member"]),
         "profile": profile,
         "usage": {
@@ -193,7 +196,8 @@ def set_founding(email: str, on: bool) -> dict:
 def subscriptions() -> dict:
     with db.cursor() as c:
         rows = c.execute(
-            "SELECT email, name, plan, subscription_status, stripe_customer, created_at "
+            "SELECT email, name, plan, subscription_status, stripe_customer, "
+            "stripe_subscription, plan_interval, subscribed_at, created_at "
             "FROM users WHERE subscription_status IS NOT NULL ORDER BY created_at DESC"
         ).fetchall()
         failed = c.execute(
@@ -205,7 +209,11 @@ def subscriptions() -> dict:
     def bucket(statuses):
         return [
             {"email": r["email"], "name": r["name"] or "", "status": r["subscription_status"],
-             "since": (r["created_at"] or "")[:10]}
+             "interval": r["plan_interval"] or "—",
+             "purchased": (r["subscribed_at"] or "")[:10] or "—",
+             "since": (r["created_at"] or "")[:10],
+             "stripe_customer": r["stripe_customer"] or "",
+             "stripe_subscription": r["stripe_subscription"] or ""}
             for r in rows if r["subscription_status"] in statuses
         ]
 
@@ -233,6 +241,14 @@ def analytics() -> dict:
         canceled = c.execute(
             "SELECT COUNT(*) n FROM users WHERE subscription_status = 'canceled'"
         ).fetchone()["n"]
+        monthly_subs = c.execute(
+            "SELECT COUNT(*) n FROM users WHERE subscription_status IN (?, ?) "
+            "AND plan_interval = 'monthly'", _PAYING
+        ).fetchone()["n"]
+        yearly_subs = c.execute(
+            "SELECT COUNT(*) n FROM users WHERE subscription_status IN (?, ?) "
+            "AND plan_interval = 'yearly'", _PAYING
+        ).fetchone()["n"]
         new_users = c.execute(
             "SELECT COUNT(*) n FROM users WHERE substr(created_at,1,7) = ?", (period,)
         ).fetchone()["n"]
@@ -255,7 +271,18 @@ def analytics() -> dict:
             (period,),
         ).fetchone()
 
-    mrr = round(paying * config.MRR_PER_SUBSCRIBER, 2)
+    # Interval-accurate revenue: monthly subs bill $19.99/mo, yearly subs bill
+    # $99/yr (≈ $8.25/mo of MRR). Subscribers whose interval predates this
+    # tracking fall back to the flat per-subscriber estimate so MRR never dips.
+    _MONTHLY_PRICE, _YEARLY_PRICE = 19.99, 99.0
+    known = monthly_subs + yearly_subs
+    unknown = max(0, paying - known)
+    mrr = round(
+        monthly_subs * _MONTHLY_PRICE
+        + yearly_subs * (_YEARLY_PRICE / 12.0)
+        + unknown * config.MRR_PER_SUBSCRIBER,
+        2,
+    )
     conversion = round(paying / total * 100, 1) if total else 0.0
     verified_pct = round(verified / total * 100, 1) if total else 0.0
     churn = round(canceled / ever_subscribed * 100, 1) if ever_subscribed else 0.0
@@ -267,6 +294,9 @@ def analytics() -> dict:
         "verified_pct": verified_pct,
         "premium_users": premium,
         "paying_subscribers": paying,
+        "monthly_subscribers": monthly_subs,
+        "yearly_subscribers": yearly_subs,
+        "yearly_revenue_booked": round(yearly_subs * 99.0, 2),
         "past_due": past_due,
         "canceled": canceled,
         "conversion_rate_pct": conversion,
@@ -281,6 +311,40 @@ def analytics() -> dict:
         "usage_this_month": {
             "scans": u["s"], "coach": u["co"], "active_users": u["act"],
         },
+    }
+
+
+# ---------------- community moderation ----------------
+def community_moderation(limit: int = 100) -> dict:
+    """Recent community posts and comments for moderation (view + delete).
+    Safe if the community tables don't exist yet (returns empty lists)."""
+    limit = max(1, min(int(limit or 100), 500))
+    with db.cursor() as c:
+        have = {r["name"] for r in c.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()}
+        posts, comments = [], []
+        if "posts" in have:
+            posts = [dict(r) for r in c.execute(
+                "SELECT p.id, p.type, p.text, p.image, p.created_at, "
+                "u.email AS author_email, u.name AS author_name, "
+                "(SELECT COUNT(*) FROM post_likes WHERE post_id=p.id) AS likes, "
+                "(SELECT COUNT(*) FROM post_comments WHERE post_id=p.id) AS comments "
+                "FROM posts p LEFT JOIN users u ON u.id=p.user_id "
+                "ORDER BY p.id DESC LIMIT ?", (limit,)
+            ).fetchall()]
+        if "post_comments" in have:
+            comments = [dict(r) for r in c.execute(
+                "SELECT cm.id, cm.post_id, cm.text, cm.created_at, "
+                "u.email AS author_email, u.name AS author_name "
+                "FROM post_comments cm LEFT JOIN users u ON u.id=cm.user_id "
+                "ORDER BY cm.id DESC LIMIT ?", (limit,)
+            ).fetchall()]
+    return {
+        "posts": posts,
+        "comments": comments,
+        "post_count": len(posts),
+        "comment_count": len(comments),
     }
 
 
