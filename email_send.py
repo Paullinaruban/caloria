@@ -206,3 +206,26 @@ def send_reset(to: str, link: str) -> None:
         "If you didn't request it, ignore this email."
     )
     _send(to, "Reset your Caloria password", html, text)
+
+
+def send_reset_code(to: str, code: str) -> None:
+    code_html = (
+        '<div style="font-family:-apple-system,Segoe UI,sans-serif;font-size:34px;'
+        'font-weight:700;letter-spacing:10px;color:#2a2230;background:#fff;'
+        'border:1px solid #efe6ec;border-radius:14px;padding:18px 0;text-align:center;'
+        f'margin:18px 0">{code}</div>'
+    )
+    html = _shell(
+        "Reset your password",
+        "<p>We received a request to reset your Caloria password. Enter this code "
+        "in the app to choose a new one:</p>" + code_html
+        + f"<p style='color:#8a7886;font-size:12px'>This code expires in "
+          f"{config.RESET_CODE_TTL_MINUTES} minutes. If you didn't ask for this, "
+          "your password is unchanged.</p>",
+    )
+    text = (
+        f"Your Caloria password reset code is: {code}\n"
+        f"It expires in {config.RESET_CODE_TTL_MINUTES} minutes. "
+        "If you didn't request it, ignore this email — your password is unchanged."
+    )
+    _send(to, "Your Caloria password reset code", html, text)

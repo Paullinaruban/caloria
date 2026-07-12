@@ -57,3 +57,12 @@ services:
         value: "polinaryzova8@gmail.com"
       - key: EMAIL_RETENTION_ENABLED
         value: "true"
+      # --- Founding Member badge (private launch) ---
+      # After this day ends (UTC) the badge can never be granted again.
+      - key: FOUNDING_MEMBER_DEADLINE
+        value: "2026-07-15"
+      # The private invite list is set in the Render dashboard (Environment tab),
+      # NOT committed here, so the emails stay private:
+      #   FOUNDING_MEMBER_EMAILS = comma-separated invited emails
+      - key: FOUNDING_MEMBER_EMAILS
+        sync: false

@@ -109,20 +109,32 @@ def _ensure_price(interval: str, currency: str = "USD") -> str:
     return price["id"]
 
 
-def create_checkout(user, interval: str, currency: str = "USD") -> str:
+def create_checkout(user, interval: str, return_base: str = "") -> str:
     if interval not in ("monthly", "yearly"):
         raise BillingError("Invalid plan interval.")
-    currency = config.normalize_currency(currency)
-    price_id = _ensure_price(interval, currency)
-    print(f"[caloria] checkout: mode={_key_mode()} interval={interval} currency={currency} price={price_id}")
+    # ONE base price (USD). We never pin a currency here — Stripe Adaptive Pricing
+    # (enabled on the account) automatically presents and charges each customer in
+    # their local currency at checkout. Passing a currency-specific price would
+    # DISABLE Adaptive Pricing, so we deliberately always use the base price.
+    price_id = _ensure_price(interval)
+    # Return to the site the request came from (so a private preview deployment
+    # lands back on the preview, not the main domain). Only allow-listed origins
+    # are honored — anything else falls back to APP_BASE_URL.
+    rb = (return_base or "").rstrip("/")
+    base = (rb if rb and any(config._origin_matches(rb, p) for p in config.ALLOWED_ORIGINS)
+            else config.APP_BASE_URL.rstrip("/"))
+    print(f"[caloria] checkout: mode={_key_mode()} interval={interval} price={price_id} return={base}")
     params = {
         "mode": "subscription",
         "line_items[0][price]": price_id,
         "line_items[0][quantity]": 1,
         "client_reference_id": str(user["id"]),
         "customer_email": user["email"],
-        "success_url": f"{config.APP_BASE_URL}/?checkout=success",
-        "cancel_url": f"{config.APP_BASE_URL}/?checkout=cancel",
+        # The {CHECKOUT_SESSION_ID} template is filled in by Stripe on redirect, so
+        # the app can confirm the payment server-side immediately — no waiting on
+        # the webhook (which stays the source of truth for renewals/cancellations).
+        "success_url": f"{base}/?checkout=success&session_id={{CHECKOUT_SESSION_ID}}",
+        "cancel_url": f"{base}/?checkout=cancel",
         "allow_promotion_codes": "true",
     }
     # Free trial — no charge until the trial ends; cancel anytime before then.
@@ -130,6 +142,38 @@ def create_checkout(user, interval: str, currency: str = "USD") -> str:
         params["subscription_data[trial_period_days]"] = config.TRIAL_DAYS
     session = _stripe("checkout/sessions", params)
     return session["url"]
+
+
+def confirm_checkout(user, session_id: str) -> bool:
+    """Activate Premium immediately on the post-checkout redirect by verifying the
+    Checkout Session directly with Stripe — so the user isn't left waiting on the
+    webhook. Idempotent: safe if the webhook already activated. Returns True when
+    the account is (now) premium.
+
+    Security: only activates if the session is paid/active AND its
+    client_reference_id matches THIS user, so a session id can't be replayed to
+    upgrade someone else's account."""
+    if not session_id or not config.stripe_ready():
+        return False
+    try:
+        s = _stripe(f"checkout/sessions/{session_id}", method="GET")
+    except BillingError as e:
+        print(f"[caloria] confirm_checkout lookup failed: {e}")
+        return False
+    if str(s.get("client_reference_id") or "") != str(user["id"]):
+        return False   # session belongs to a different account — ignore
+    paid = (s.get("payment_status") == "paid") or (s.get("status") == "complete")
+    if not paid:
+        return False
+    with db.cursor() as c:
+        c.execute(
+            "UPDATE users SET plan='premium', subscription_status='active', "
+            "stripe_customer=COALESCE(?, stripe_customer), "
+            "stripe_subscription=COALESCE(?, stripe_subscription) WHERE id=?",
+            (s.get("customer"), s.get("subscription"), user["id"]),
+        )
+    _log_event("checkout.confirmed", s.get("customer"), "active", user_id=user["id"])
+    return True
 
 
 # ---------- webhooks ----------

@@ -58,8 +58,9 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _cors(self):
-        self.send_header("Access-Control-Allow-Origin", config.ALLOWED_ORIGIN)
-        if config.ALLOWED_ORIGIN != "*":
+        allow = config.cors_origin_for(self.headers.get("Origin", ""))
+        self.send_header("Access-Control-Allow-Origin", allow)
+        if allow != "*":
             self.send_header("Vary", "Origin")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
@@ -165,7 +166,7 @@ class Handler(BaseHTTPRequestHandler):
         "/api/health", "/api/config", "/api/me",
         "/api/auth/signup", "/api/auth/login", "/api/auth/logout",
         "/api/auth/verify-code", "/api/auth/resend",
-        "/api/auth/forgot", "/api/auth/reset",
+        "/api/auth/forgot", "/api/auth/reset", "/api/auth/reset-check",
         "/api/billing/checkout", "/api/billing/portal",
         "/api/billing/webhook", "/api/billing/status",
         # Caloria Club (founding members) — public by design: visitors join with
@@ -239,13 +240,10 @@ class Handler(BaseHTTPRequestHandler):
                 "stripe_configured": config.stripe_ready(),
                 "images_enabled": images.available(),
                 "free_scan_limit": config.FREE_SCAN_LIMIT,
+                # Base price shown on the pricing page. Stripe Adaptive Pricing
+                # converts to each customer's local currency at checkout.
                 "price_monthly": config.PRICE_MONTHLY_DISPLAY,
                 "price_yearly": config.PRICE_YEARLY_DISPLAY,
-                # Multi-currency: per-currency display strings + which currencies
-                # are actually offered (USD always; others when their prices exist).
-                "currencies": config.currency_display(),
-                "available_currencies": config.available_currencies(),
-                "default_currency": "USD",
                 "trial_days": config.TRIAL_DAYS,
                 # Public bits the frontend needs (site key is meant to be public).
                 "turnstile_site_key": config.TURNSTILE_SITE_KEY,
@@ -397,6 +395,14 @@ class Handler(BaseHTTPRequestHandler):
                 return
             qs = parse_qs(urlparse(self.path).query)
             return self._send(200, club.audience_count((qs.get("audience") or ["all"])[0]))
+        if path == "/api/club/admin/campaign-count":
+            if not self._require_admin():
+                return
+            qs = parse_qs(urlparse(self.path).query)
+            try:
+                return self._send(200, club.campaign_recipients((qs.get("kind") or [""])[0]))
+            except club.ClubError as e:
+                return self._send(e.code, {"error": e.message})
         if path == "/api/club/admin/health":
             # Launch-control status card: API (reaching this = up), database
             # (live read+write probe), email service (config + today's volume).
@@ -532,6 +538,7 @@ class Handler(BaseHTTPRequestHandler):
             "/api/auth/resend": self._resend_verification,
             "/api/auth/forgot": self._forgot_password,
             "/api/auth/reset": self._reset_password,
+            "/api/auth/reset-check": self._reset_check_code,
             "/api/onboarding": self._onboarding,
             "/api/analyze": self._analyze,
             "/api/correct": self._correct,
@@ -552,10 +559,12 @@ class Handler(BaseHTTPRequestHandler):
             "/api/notifications/seen": self._notifications_seen,
             "/api/workout/complete": self._workout_complete,
             "/api/billing/checkout": self._checkout,
+            "/api/billing/confirm": self._billing_confirm,
             "/api/billing/portal": self._billing_portal,
             "/api/club/join": self._club_join,
             "/api/club/answers": self._club_answers,
             "/api/club/admin/send-update": self._club_send_update,
+            "/api/club/admin/send-campaign": self._club_send_campaign,
             "/api/club/admin/test-update": self._club_test_update,
             "/api/club/admin/preview-update": self._club_preview_update,
             "/api/club/admin/resume-update": self._club_resume_update,
@@ -633,15 +642,30 @@ class Handler(BaseHTTPRequestHandler):
         self._send(200, {"ok": True})
 
     def _reset_password(self, data):
+        # Code-based reset: {email, code, password}. Rate-limited like verify.
+        if self._rate_limited("verify_code", self._client_ip()):
+            return
         try:
-            ok = auth.reset_password(str(data.get("token", "")), str(data.get("password", "")))
+            ok = auth.reset_password_with_code(
+                str(data.get("email", "")), str(data.get("code", "")),
+                str(data.get("password", "")),
+            )
         except auth.AuthError as e:
             return self._send(e.code, {"error": e.message})
         if not ok:
             return self._send(400, {
-                "error": "This reset link is invalid or has expired. Please request a new one.",
+                "error": "That code is incorrect or has expired. Please check the code or request a new one.",
                 "expired": True,
             })
+        self._send(200, {"ok": True})
+
+    def _reset_check_code(self, data):
+        """Non-burning check so the UI can advance to the new-password step."""
+        if self._rate_limited("verify_code", self._client_ip()):
+            return
+        ok = auth.check_reset_code(str(data.get("email", "")), str(data.get("code", "")))
+        if not ok:
+            return self._send(400, {"error": "That code is incorrect or has expired."})
         self._send(200, {"ok": True})
 
     def _notifications_seen(self, data):
@@ -966,6 +990,16 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(e.code, {"error": e.message})
         self._send(200, res)
 
+    def _club_send_campaign(self, data):
+        """Send a pre-built campaign (Tomorrow / Early Access) to all members."""
+        if not self._require_admin():
+            return
+        try:
+            res = club.send_campaign(str(data.get("kind", "")))
+        except club.ClubError as e:
+            return self._send(e.code, {"error": e.message})
+        self._send(200, res)
+
     def _club_test_update(self, data):
         """Send one personalized test email to the signed-in admin only."""
         u = self._require_admin()
@@ -1053,6 +1087,10 @@ class Handler(BaseHTTPRequestHandler):
                 res = admin.set_premium(email, True)
             elif action == "revoke_premium":
                 res = admin.set_premium(email, False)
+            elif action == "grant_founding":
+                res = admin.set_founding(email, True)
+            elif action == "revoke_founding":
+                res = admin.set_founding(email, False)
             elif action == "delete":
                 account.delete_by_email(email)
                 return self._send(200, {"ok": True, "deleted": True})
@@ -1125,16 +1163,26 @@ class Handler(BaseHTTPRequestHandler):
             return
         if not self._require_verified(u):
             return
-        # Currency preference: explicit `currency`, else derived from `country`,
-        # else USD. billing normalizes/validates and falls back to USD.
-        currency = data.get("currency") or ""
-        if not currency and data.get("country"):
-            currency = config.currency_for_country(data.get("country"))
+        # No currency handling here — Stripe Adaptive Pricing presents each
+        # customer their local currency at checkout from the single base price.
         try:
-            url = billing.create_checkout(auth.public_user(u), data.get("interval", "monthly"), currency or "USD")
+            url = billing.create_checkout(auth.public_user(u), data.get("interval", "monthly"),
+                                          return_base=self.headers.get("Origin", ""))
         except billing.BillingError as e:
             return self._send(503, {"error": str(e)})
         self._send(200, {"url": url})
+
+    def _billing_confirm(self, data):
+        """Post-checkout: activate Premium immediately by verifying the session
+        with Stripe (webhook-independent). Returns the refreshed user."""
+        u = self._require_user()
+        if not u:
+            return
+        try:
+            billing.confirm_checkout(u, str(data.get("session_id", "")))
+        except Exception as e:  # noqa: BLE001 — never 500 the return flow
+            print(f"[caloria] billing confirm error: {e}")
+        self._send(200, {"user": auth.public_user(self._user())})   # refreshed post-activation
 
     def _billing_portal(self, data):
         u = self._require_user()

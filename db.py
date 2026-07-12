@@ -116,6 +116,10 @@ def init_db() -> None:
         _add_column(c, "users", "subscription_status", "TEXT")     # active|trialing|past_due|canceled
         _add_column(c, "users", "stripe_subscription", "TEXT")     # sub_...
         _add_column(c, "users", "active", "INTEGER NOT NULL DEFAULT 1")  # admin can deactivate
+        # Founding Member badge (private launch) — permanent once set. See
+        # config.FOUNDING_MEMBER_EMAILS and auth.grant_founding_if_invited().
+        _add_column(c, "users", "founding_member", "INTEGER NOT NULL DEFAULT 0")
+        _add_column(c, "users", "founding_member_at", "TEXT")
         # Consent evidence captured at signup (auditable).
         _add_column(c, "users", "terms_accepted", "INTEGER NOT NULL DEFAULT 0")
         _add_column(c, "users", "privacy_accepted", "INTEGER NOT NULL DEFAULT 0")
@@ -243,6 +247,20 @@ def init_db() -> None:
         # that dies mid-send resumes from last_member_id — no duplicate emails.
         _add_column(c, "club_updates", "audience", "TEXT NOT NULL DEFAULT 'all'")
         _add_column(c, "club_updates", "last_member_id", "INTEGER NOT NULL DEFAULT 0")
+        # Pre-built campaign templates ('tomorrow' | 'early_access'); '' = a
+        # free-form founder update. Determines which HTML template is rendered.
+        _add_column(c, "club_updates", "campaign", "TEXT NOT NULL DEFAULT ''")
+        # Per-recipient record of pre-built campaigns already delivered, so
+        # pressing "Send" twice never emails the same person the same campaign
+        # again (idempotent across separate button presses).
+        c.execute(
+            """CREATE TABLE IF NOT EXISTS club_campaign_sends (
+                email      TEXT NOT NULL,
+                campaign   TEXT NOT NULL,
+                sent_at    TEXT DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (email, campaign)
+            )"""
+        )
 
 
 def kv_get(key: str):

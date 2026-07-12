@@ -119,6 +119,7 @@ def user_detail(email: str) -> dict:
         "joined": (r["created_at"] or "")[:10],
         "subscription_status": r["subscription_status"] or "—",
         "stripe_customer": r["stripe_customer"] or None,
+        "founding_member": bool(r["founding_member"]),
         "profile": profile,
         "usage": {
             "period": period,
@@ -159,6 +160,30 @@ def set_premium(email: str, on: bool) -> dict:
         else:
             c.execute(
                 "UPDATE users SET plan = 'free', subscription_status = 'canceled' WHERE id = ?",
+                (r["id"],),
+            )
+    return user_detail(email)
+
+
+def set_founding(email: str, on: bool) -> dict:
+    """Manually grant/revoke the Founding Member badge (bypasses the invite list
+    and window — for hand-picked additions or corrections)."""
+    import datetime
+    email = (email or "").strip().lower()
+    with db.cursor() as c:
+        r = c.execute("SELECT id FROM users WHERE email = ?", (email,)).fetchone()
+        if not r:
+            raise ValueError("No user with that email.")
+        if on:
+            now = datetime.datetime.utcnow().isoformat() + "Z"
+            c.execute(
+                "UPDATE users SET founding_member = 1, "
+                "founding_member_at = COALESCE(founding_member_at, ?) WHERE id = ?",
+                (now, r["id"]),
+            )
+        else:
+            c.execute(
+                "UPDATE users SET founding_member = 0, founding_member_at = NULL WHERE id = ?",
                 (r["id"],),
             )
     return user_detail(email)

@@ -139,6 +139,32 @@ def verify_code(user_id: int, kind: str, code: str, max_attempts: int) -> bool:
         return False
 
 
+def check_code(user_id: int, kind: str, code: str) -> bool:
+    """Non-burning validity check: True if `code` matches the user's current
+    unused, unexpired code of `kind`. Does NOT consume it or count an attempt —
+    used to advance a multi-step UI before the final consuming step."""
+    code = (code or "").strip()
+    if not (code.isdigit() and len(code) == 6):
+        return False
+    with db.cursor() as c:
+        row = c.execute(
+            "SELECT token_hash, expires_at, used_at FROM account_tokens "
+            "WHERE user_id = ? AND kind = ? AND used_at IS NULL "
+            "ORDER BY id DESC LIMIT 1",
+            (user_id, kind),
+        ).fetchone()
+    if not row:
+        return False
+    try:
+        expires = datetime.datetime.fromisoformat(row["expires_at"])
+    except (TypeError, ValueError):
+        return False
+    if _now() > expires:
+        return False
+    import hmac
+    return hmac.compare_digest(row["token_hash"], _hash(code))
+
+
 def purge_expired() -> None:
     """Housekeeping: drop expired/used tokens. Safe to call periodically."""
     cutoff = (_now() - datetime.timedelta(days=2)).isoformat()

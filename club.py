@@ -569,28 +569,46 @@ def _run_broadcast(update_id: int) -> None:
         if not camp:
             return
         _label, where = _AUDIENCES.get(camp["audience"], _AUDIENCES["all"])
+        kind = camp["campaign"] if "campaign" in camp.keys() else ""
+        # Pre-built campaigns dedupe across button presses: skip anyone already
+        # recorded as having received THIS campaign.
+        dedup = (" AND email NOT IN (SELECT email FROM club_campaign_sends WHERE campaign = ?)"
+                 if kind in CAMPAIGNS else "")
+        dedup_args = (kind,) if dedup else ()
         sent, failed = camp["sent"], camp["failed"]
         while True:
             # One member at a time, always above the watermark — a crash or
             # restart can never produce a duplicate send.
             with db.cursor() as c:
                 row = c.execute(
-                    f"SELECT * FROM club_members WHERE {where} AND id > ? "
-                    "ORDER BY id LIMIT 1", (camp["last_member_id"],),
+                    f"SELECT * FROM club_members WHERE {where}{dedup} AND id > ? "
+                    "ORDER BY id LIMIT 1", (*dedup_args, camp["last_member_id"]),
                 ).fetchone()
                 if row:
                     tags = _member_vars(c, row)
             if not row:
                 break
-            subject_p = _personalize(camp["subject"], tags)
-            message_p = _personalize(camp["body"], tags)
+            if kind in CAMPAIGNS:
+                # Pre-built campaign: fixed template, personalized greeting.
+                with db.cursor() as c:
+                    fname = _first_name(c, row["email"])
+                built = CAMPAIGNS[kind]["render"](fname, row["email"])
+                subject_p, html_p, text_p = built["subject"], built["html"], built["text"]
+            else:
+                # Free-form founder update: personalize with merge tags.
+                subject_p = _personalize(camp["subject"], tags)
+                message_p = _personalize(camp["body"], tags)
+                html_p = _update_html(subject_p, message_p, row["email"])
+                text_p = _update_text(subject_p, message_p, row["email"])
             try:
-                email_send._send(row["email"], subject_p,
-                                 _update_html(subject_p, message_p, row["email"]),
-                                 _update_text(subject_p, message_p, row["email"]),
+                email_send._send(row["email"], subject_p, html_p, text_p,
                                  headers=_unsub_headers(row["email"]))
                 _bump_email_counter()
                 sent += 1
+                if kind in CAMPAIGNS:  # record so a re-press never re-sends
+                    with db.cursor() as c:
+                        c.execute("INSERT OR IGNORE INTO club_campaign_sends (email, campaign) "
+                                  "VALUES (?, ?)", (row["email"], kind))
             except Exception as e:  # noqa: BLE001 — one bad address must not stop the run
                 failed += 1
                 print(f"[caloria][club] founder update to {row['email']} failed: {e}")
@@ -607,6 +625,189 @@ def _run_broadcast(update_id: int) -> None:
     finally:
         with _active_lock:
             _active_broadcasts.discard(update_id)
+
+
+# ---------- pre-built campaigns (Tomorrow / Early Access) ----------
+def _first_name(c, email: str) -> str:
+    """Personalized greeting name: the first word of the member's account name
+    (waitlist rows have no name, so we cross-reference the users table by email
+    and canonical email). Falls back to 'beautiful' — the intended default."""
+    canon = _canonical_email(email)
+    row = c.execute(
+        "SELECT name FROM users WHERE lower(email) = ? OR lower(email) = ? "
+        "ORDER BY id LIMIT 1", (email.lower(), canon),
+    ).fetchone() if _users_table_exists(c) else None
+    name = (row["name"].strip() if row and row["name"] else "")
+    if name:
+        first = name.split()[0]
+        # Guard against an email-shaped "name".
+        if "@" not in first:
+            return first[:40]
+    return "beautiful"
+
+
+def _users_table_exists(c) -> bool:
+    return bool(c.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='users'"
+    ).fetchone())
+
+
+_CAMPAIGN_BTN = (
+    'style="display:inline-block;background:linear-gradient(135deg,#ff9ec4,#f24d8c);'
+    'color:#ffffff;text-decoration:none;padding:15px 34px;border-radius:100px;'
+    'font-weight:700;font-size:16px"'
+)
+
+
+def _campaign_shell(preheader: str, badge: str, inner: str, recipient_email: str) -> str:
+    unsub = (
+        f'<br><a href="{_unsubscribe_link(recipient_email)}" '
+        'style="color:#b7a6b0;text-decoration:underline">Unsubscribe</a>'
+        if recipient_email else ""
+    )
+    body = f"""\
+<div style="margin:0;padding:34px 14px;background:linear-gradient(180deg,#fff6fb 0%,#fdeef6 55%,#eef9f8 100%)">
+ <div style="max-width:500px;margin:0 auto;font-family:{_SANS};color:#3a2937">
+  <p style="text-align:center;margin:0 0 22px;font-family:{_SERIF};font-size:25px;font-weight:700;letter-spacing:-.02em">◍ Caloria</p>
+  <div style="background:#ffffff;border:1px solid #ffe6f1;border-radius:28px;padding:40px 32px;box-shadow:0 16px 44px rgba(242,77,140,.13)">
+   <p style="text-align:center;margin:0 0 22px"><span style="display:inline-block;background:#fff5fa;color:#f24d8c;font-size:11px;font-weight:800;letter-spacing:.12em;text-transform:uppercase;padding:7px 16px;border-radius:100px;border:1px solid #ffd7e7">{badge}</span></p>
+   {inner}
+  </div>
+  <p style="text-align:center;color:#b7a6b0;font-size:12px;margin:22px 0 0;line-height:1.6">Caloria Club · made with 🤍 for the first women inside.{unsub}</p>
+ </div>
+</div>"""
+    return _email_doc(body, preheader)
+
+
+def _campaign_tomorrow(first_name: str, recipient_email: str = "") -> dict:
+    url = config.APP_BASE_URL.rstrip("/") + "/"   # the waitlist page
+    unlocks = "".join(
+        f'<tr><td style="padding:5px 0;font-size:16px;line-height:1.5">✨&nbsp; {u}</td></tr>'
+        for u in ["Early Access", "Founding Member pricing",
+                  "Your exclusive Founding Member badge", "Full access before the public launch"]
+    )
+    inner = f"""\
+   <h1 style="font-family:{_SERIF};font-size:30px;font-weight:600;letter-spacing:-.015em;text-align:center;margin:0 0 24px;line-height:1.15">✨ Tomorrow.</h1>
+   <p style="font-size:16px;line-height:1.75;margin:0 0 16px">Hi {first_name},</p>
+   <p style="font-size:16px;line-height:1.75;margin:0 0 16px">Tomorrow is the day.</p>
+   <p style="font-size:16px;line-height:1.75;margin:0 0 18px">As one of our Founding Members, you'll receive your private invitation to <b>Caloria Club</b> before anyone else.</p>
+   <p style="font-size:16px;line-height:1.6;margin:0 0 8px;font-weight:700">Tomorrow you'll unlock:</p>
+   <table style="width:100%;border-collapse:collapse;margin:0 0 20px">{unlocks}</table>
+   <p style="font-size:16px;line-height:1.75;margin:0 0 16px">You're one day away.</p>
+   <p style="font-size:16px;line-height:1.75;margin:0 0 24px">See you tomorrow.</p>
+   <p style="font-size:16px;line-height:1.75;margin:0 0 26px">— Caloria Club</p>
+   <p style="text-align:center;margin:0"><a href="{url}" {_CAMPAIGN_BTN}>See You Tomorrow</a></p>"""
+    text = (
+        f"Hi {first_name},\n\n"
+        "Tomorrow is the day.\n\n"
+        "As one of our Founding Members, you'll receive your private invitation to "
+        "Caloria Club before anyone else.\n\n"
+        "Tomorrow you'll unlock:\n"
+        "  ✨ Early Access\n  ✨ Founding Member pricing\n"
+        "  ✨ Your exclusive Founding Member badge\n  ✨ Full access before the public launch\n\n"
+        "You're one day away.\n\nSee you tomorrow.\n\n— Caloria Club\n\n"
+        f"See you tomorrow: {url}"
+    )
+    return {
+        "subject": "✨ Tomorrow.",
+        "html": _campaign_shell("Your Early Access begins tomorrow.", "✦ Caloria Club", inner, recipient_email),
+        "text": text,
+    }
+
+
+def _campaign_early_access(first_name: str, recipient_email: str = "") -> dict:
+    url = config.APP_BASE_URL.rstrip("/") + "/"   # the live website
+    features = "".join(
+        f'<tr><td style="padding:5px 0;font-size:16px;line-height:1.5">'
+        f'<span style="color:#f24d8c">•</span>&nbsp; {f}</td></tr>'
+        for f in ["AI Supermodel Coach", "AI Meal Scanner", "Personalized Meal Plans",
+                  "Personalized Workout Plans", "Wellness Community",
+                  "Exclusive member content", "Future updates included"]
+    )
+    inner = f"""\
+   <h1 style="font-family:{_SERIF};font-size:29px;font-weight:600;letter-spacing:-.015em;text-align:center;margin:0 0 24px;line-height:1.2">✨ Your invitation is here.</h1>
+   <p style="font-size:16px;line-height:1.75;margin:0 0 16px">Hi {first_name},</p>
+   <p style="font-size:16px;line-height:1.75;margin:0 0 16px">The wait is finally over.</p>
+   <p style="font-size:16px;line-height:1.75;margin:0 0 18px">Your Early Access to <b>Caloria Club</b> is officially open.</p>
+   <p style="font-size:16px;line-height:1.6;margin:0 0 8px;font-weight:700">Inside you'll find:</p>
+   <table style="width:100%;border-collapse:collapse;margin:0 0 20px">{features}</table>
+   <p style="font-size:16px;line-height:1.75;margin:0 0 16px">Thank you for being one of the very first members of Caloria Club.</p>
+   <p style="font-size:16px;line-height:1.75;margin:0 0 16px">I'm so excited to have you here.</p>
+   <p style="font-size:16px;line-height:1.75;margin:0 0 24px">See you inside.</p>
+   <p style="font-size:16px;line-height:1.75;margin:0 0 26px">— Polina 🤍</p>
+   <p style="text-align:center;margin:0"><a href="{url}" {_CAMPAIGN_BTN}>Enter Caloria Club</a></p>"""
+    text = (
+        f"Hi {first_name},\n\n"
+        "The wait is finally over.\n\n"
+        "Your Early Access to Caloria Club is officially open.\n\n"
+        "Inside you'll find:\n"
+        "  • AI Supermodel Coach\n  • AI Meal Scanner\n  • Personalized Meal Plans\n"
+        "  • Personalized Workout Plans\n  • Wellness Community\n"
+        "  • Exclusive member content\n  • Future updates included\n\n"
+        "Thank you for being one of the very first members of Caloria Club.\n\n"
+        "I'm so excited to have you here.\n\nSee you inside.\n\n— Polina 🤍\n\n"
+        f"Enter Caloria Club: {url}"
+    )
+    return {
+        "subject": "✨ Your invitation is here.",
+        "html": _campaign_shell("Welcome to Caloria Club.", "✦ Early Access", inner, recipient_email),
+        "text": text,
+    }
+
+
+CAMPAIGNS = {
+    "tomorrow": {"label": "Tomorrow", "subject": "✨ Tomorrow.", "render": _campaign_tomorrow},
+    "early_access": {"label": "Early Access", "subject": "✨ Your invitation is here.", "render": _campaign_early_access},
+}
+
+
+def campaign_recipients(kind: str) -> dict:
+    """Recipient breakdown for the confirmation dialog: how many will receive it,
+    how many are skipped (unsubscribed), and how many already got this campaign
+    (so a second press only reaches new members)."""
+    if kind not in CAMPAIGNS:
+        raise ClubError("Unknown campaign.")
+    with db.cursor() as c:
+        total = c.execute("SELECT COUNT(*) AS n FROM club_members").fetchone()["n"]
+        unsub = c.execute(
+            "SELECT COUNT(*) AS n FROM club_members WHERE unsubscribed = 1"
+        ).fetchone()["n"]
+        # Eligible = subscribed AND not already sent this campaign.
+        recipients = c.execute(
+            "SELECT COUNT(*) AS n FROM club_members WHERE unsubscribed = 0 "
+            "AND email NOT IN (SELECT email FROM club_campaign_sends WHERE campaign = ?)",
+            (kind,),
+        ).fetchone()["n"]
+        already = c.execute(
+            "SELECT COUNT(*) AS n FROM club_members WHERE unsubscribed = 0 "
+            "AND email IN (SELECT email FROM club_campaign_sends WHERE campaign = ?)",
+            (kind,),
+        ).fetchone()["n"]
+    return {"kind": kind, "label": CAMPAIGNS[kind]["label"], "recipients": recipients,
+            "skipped": unsub + already, "already_sent": already, "unsubscribed": unsub, "total": total}
+
+
+def send_campaign(kind: str) -> dict:
+    """Queue a pre-built campaign (Tomorrow / Early Access) to every subscribed
+    waitlist member. Reuses the resumable broadcast worker; each email is
+    personalized with the member's first name."""
+    if kind not in CAMPAIGNS:
+        raise ClubError("Unknown campaign.")
+    if not config.email_ready():
+        raise ClubError("Resend is not configured — set RESEND_API_KEY first.", 503)
+    info = campaign_recipients(kind)
+    if not info["recipients"]:
+        raise ClubError("There are no subscribed members to send to yet.")
+    subject = CAMPAIGNS[kind]["subject"]
+    with db.cursor() as c:
+        c.execute(
+            "INSERT INTO club_updates (subject, body, total, status, audience, campaign) "
+            "VALUES (?,?,?,'sending','all',?)",
+            (subject, "", info["recipients"], kind),
+        )
+        update_id = c.lastrowid
+    _launch_broadcast(update_id)
+    return {"id": update_id, "total": info["recipients"], "skipped": info["skipped"], "status": "sending"}
 
 
 # ---------- admin ----------
@@ -750,12 +951,13 @@ def updates() -> list:
             c.executemany("UPDATE club_updates SET status = 'interrupted' WHERE id = ?",
                           [(i,) for i in stale])
         rows = c.execute(
-            "SELECT id, subject, audience, total, sent, failed, status, created_at "
+            "SELECT id, subject, audience, campaign, total, sent, failed, status, created_at "
             "FROM club_updates ORDER BY id DESC LIMIT 50"
         ).fetchall()
     out = []
     for r in rows:
         d = dict(r)
         d["audience_label"] = _AUDIENCES.get(d["audience"], _AUDIENCES["all"])[0]
+        d["campaign_label"] = CAMPAIGNS[d["campaign"]]["label"] if d["campaign"] in CAMPAIGNS else ""
         out.append(d)
     return out

@@ -1,0 +1,69 @@
+# Render Blueprint for a FULLY ISOLATED Caloria PREVIEW backend.
+# ─────────────────────────────────────────────────────────────
+# This is a SECOND service, separate from production. It has:
+#   • its own database on its own disk (/data/caloria-preview.db)
+#   • its own Stripe TEST keys (no real charges)
+#   • its own origin allow-list (the preview Netlify site)
+# Nothing here touches your production database, members, or subscriptions.
+#
+# HOW TO USE:
+#   1. In Render → New + → Blueprint, point it at this file (rename to
+#      render.yaml in a separate branch/repo, OR create the service manually
+#      with these settings — Render blueprints read a file named render.yaml).
+#   2. Set the secret values (RESEND_API_KEY, STRIPE_SECRET_KEY sk_test_…,
+#      STRIPE_WEBHOOK_SECRET, FOUNDING_MEMBER_EMAILS) in the dashboard.
+#   3. Deploy the product frontend to a preview Netlify site and put its URL in
+#      APP_BASE_URL + ALLOWED_ORIGIN below.
+services:
+  - type: web
+    name: caloria-api-preview
+    runtime: python
+    plan: starter
+    buildCommand: ""
+    startCommand: python server.py
+    healthCheckPath: /api/health
+
+    disk:
+      name: caloria-preview-data      # SEPARATE disk = separate database
+      mountPath: /data
+      sizeGB: 1
+
+    envVars:
+      # Isolated database — never shared with production.
+      - key: CALORIA_DB
+        value: /data/caloria-preview.db
+      - key: PYTHON_VERSION
+        value: "3.11.9"
+      # Point these at your PREVIEW Netlify site (fill in the real URL):
+      - key: APP_BASE_URL
+        value: "https://YOUR-PREVIEW.netlify.app"
+      - key: ALLOWED_ORIGIN
+        value: "https://YOUR-PREVIEW.netlify.app"
+      - key: EMAIL_FROM
+        value: "Caloria <onboarding@resend.dev>"   # verified sender for reliable test delivery
+      - key: EMAIL_REPLY_TO
+        value: "polinaryzova8@gmail.com"
+      - key: REQUIRE_EMAIL_VERIFICATION
+        value: "true"
+      - key: APP_SECRET
+        generateValue: true
+      - key: ADMIN_EMAILS
+        value: "polinaryzova8@gmail.com"
+      - key: FOUNDING_MEMBER_DEADLINE
+        value: "2026-07-15"
+      # ---- set these in the Render dashboard (Environment tab), NOT in git ----
+      #   RESEND_API_KEY          -> re_...            (emails)
+      #   STRIPE_SECRET_KEY       -> sk_test_...       (TEST mode — no real charges)
+      #   STRIPE_WEBHOOK_SECRET   -> whsec_...         (preview webhook)
+      #   FOUNDING_MEMBER_EMAILS  -> your invite list
+      #   OPENAI_API_KEY          -> sk-...            (AI features, optional for preview)
+      - key: RESEND_API_KEY
+        sync: false
+      - key: STRIPE_SECRET_KEY
+        sync: false
+      - key: STRIPE_WEBHOOK_SECRET
+        sync: false
+      - key: FOUNDING_MEMBER_EMAILS
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false

@@ -11,6 +11,7 @@ import hashlib
 import json
 import re
 import secrets
+import threading
 
 import config
 import db
@@ -105,6 +106,7 @@ def signup(email: str, password: str, name: str = "") -> dict:
         if "UNIQUE" in str(e):
             raise AuthError("An account with that email already exists.", 409)
         raise
+    grant_founding_if_invited(user_id, email)  # permanent badge for invited emails
     sent = send_verification(user_id, email)  # never blocks signup
     return {
         "token": _new_session(user_id),
@@ -118,18 +120,28 @@ def signup(email: str, password: str, name: str = "") -> dict:
 
 # ---------- email verification (6-digit code) ----------
 def send_verification(user_id: int, email: str) -> bool:
-    """Issue a fresh 6-digit verification code and email it. Returns True only if
-    the email was actually handed to the provider. Never raises."""
+    """Issue a fresh 6-digit verification code (synchronously, so it exists the
+    instant the caller returns) and deliver the email in a background thread so a
+    slow email provider can never block or time out signup/login. The provider
+    call has its own ret/backoff. Returns True once the code is issued and handed
+    off for delivery. Never raises."""
     try:
         code = tokens.issue_code(user_id, "verify", config.VERIFY_CODE_TTL_MINUTES)
-        if not config.email_ready():
-            print(f"[caloria] verification email NOT sent — email provider not configured ({email})")
-            return False
-        email_send.send_verification_code(email, code)
-        return True
-    except Exception as e:  # noqa: BLE001 — email problems must not break the flow
-        print(f"[caloria] verification email failed for {email}: {e}")
+    except Exception as e:  # noqa: BLE001 — badge/code issues must not break auth
+        print(f"[caloria] verification code issue failed for {email}: {e}")
         return False
+    if not config.email_ready():
+        print(f"[caloria] verification email NOT sent — email provider not configured ({email})")
+        return False
+
+    def _deliver():
+        try:
+            email_send.send_verification_code(email, code)
+        except Exception as e:  # noqa: BLE001 — email problems must not break the flow
+            print(f"[caloria] verification email failed for {email}: {e}")
+
+    threading.Thread(target=_deliver, name="verify-email", daemon=True).start()
+    return True
 
 
 def verify_email_code(email: str, code: str) -> bool:
@@ -155,36 +167,50 @@ def resend_verification(email: str) -> None:
         send_verification(row["id"], email)
 
 
-# ---------- password reset ----------
+# ---------- password reset (6-digit code, same UX as email verification) ----------
 def request_reset(email: str) -> None:
-    """Email a reset link if the account exists. Always silent (no enumeration)."""
+    """Email a 6-digit reset code if the account exists. Always silent (no enumeration)."""
     email = (email or "").strip().lower()
     row = _get_user_by_email(email)
     if not row:
         return
     try:
-        raw = tokens.issue(row["id"], "reset", config.RESET_TOKEN_TTL_HOURS)
-        link = f"{config.APP_BASE_URL}/?reset={raw}"
-        email_send.send_reset(email, link)
+        code = tokens.issue_code(row["id"], "reset", config.RESET_CODE_TTL_MINUTES)
+        email_send.send_reset_code(email, code)
     except Exception as e:  # noqa: BLE001
         print(f"[caloria] reset email failed for {email}: {e}")
 
 
-def reset_password(raw_token: str, new_password: str) -> bool:
+def reset_password_with_code(email: str, code: str, new_password: str) -> bool:
+    """Verify the 6-digit reset code and set a new password. Returns False for a
+    bad/expired code or unknown account (neutral — no enumeration)."""
     if len(new_password or "") < 6:
         raise AuthError("Password must be at least 6 characters.")
-    user_id = tokens.consume(raw_token, "reset")
-    if not user_id:
+    email = (email or "").strip().lower()
+    row = _get_user_by_email(email)
+    if not row:
+        return False
+    if not tokens.verify_code(row["id"], "reset", code, config.RESET_CODE_MAX_ATTEMPTS):
         return False
     salt = secrets.token_hex(16)
     pw_hash = _hash(new_password, salt)
     with db.cursor() as c:
         c.execute(
-            "UPDATE users SET pw_salt = ?, pw_hash = ? WHERE id = ?", (salt, pw_hash, user_id)
+            "UPDATE users SET pw_salt = ?, pw_hash = ? WHERE id = ?", (salt, pw_hash, row["id"])
         )
         # Reset invalidates all existing sessions (force re-login everywhere).
-        c.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
+        c.execute("DELETE FROM sessions WHERE user_id = ?", (row["id"],))
     return True
+
+
+def check_reset_code(email: str, code: str) -> bool:
+    """Non-burning validity check so the UI can advance from the code screen to
+    the new-password screen before consuming the code."""
+    email = (email or "").strip().lower()
+    row = _get_user_by_email(email)
+    if not row:
+        return False
+    return tokens.check_code(row["id"], "reset", code)
 
 
 def _get_user_by_email(email: str):
@@ -201,6 +227,15 @@ def login(email: str, password: str) -> dict:
     if not _is_active(row):
         raise AuthError("This account has been deactivated. Please contact support.", 403)
     _maybe_rehash(row["id"], password or "", row["pw_hash"])
+    # Invited members who created their account before being added to the list
+    # earn the badge on their next login (while the window is open).
+    if grant_founding_if_invited(row["id"], email):
+        row = _get_user(row["id"])
+    # If this account still needs to verify its email, send a fresh code NOW —
+    # the login itself is what surfaces the verification modal, so the very first
+    # request must deliver a code (previously none was sent until "Resend").
+    if config.REQUIRE_EMAIL_VERIFICATION and not is_verified(row):
+        send_verification(row["id"], email)
     return {"token": _new_session(row["id"]), "user": _public_user(row)}
 
 
@@ -280,6 +315,40 @@ def is_premium(row) -> bool:
     return row["plan"] == "premium"
 
 
+def grant_founding_if_invited(user_id: int, email: str) -> bool:
+    """Permanently grant the Founding Member badge to EVERYONE who joins while
+    the launch window is open (before FOUNDING_MEMBER_DEADLINE), plus anyone on
+    the explicit invite list. The badge is set exactly once and is never revoked.
+    Once the window closes, only invite-listed emails can still earn it — normal
+    future signups never do. Idempotent, safe on every signup/login, never raises."""
+    try:
+        email = (email or "").strip().lower()
+        # Open window ⇒ every new member is a Founding Member. Closed window ⇒
+        # only an explicitly invited email still qualifies (list is empty by default).
+        eligible = config.founding_window_open() or email in config.FOUNDING_MEMBER_EMAILS
+        if not eligible:
+            return False
+        now = datetime.datetime.utcnow().isoformat() + "Z"
+        with db.cursor() as c:
+            # Only set once — the badge is permanent and its grant date is kept.
+            cur = c.execute(
+                "UPDATE users SET founding_member = 1, founding_member_at = ? "
+                "WHERE id = ? AND founding_member = 0",
+                (now, user_id),
+            )
+            return cur.rowcount > 0
+    except Exception as e:  # noqa: BLE001 — badge must never break auth
+        print(f"[caloria] founding badge grant failed for {email}: {e}")
+        return False
+
+
+def is_founding(row) -> bool:
+    try:
+        return bool(row["founding_member"])
+    except (IndexError, KeyError):
+        return False
+
+
 def _public_user(row) -> dict:
     import config
     premium = is_premium(row)
@@ -291,6 +360,7 @@ def _public_user(row) -> dict:
         "plan": "premium" if premium else row["plan"],
         "is_admin": (row["email"] or "").lower() in config.ADMIN_EMAILS,
         "dev_unlimited": config.DEV_UNLIMITED,
+        "founding_member": is_founding(row),
         "scans_used": row["scans_used"],
         # The user's own verification state (not an internal usage counter).
         "email_verified": is_verified(row),

@@ -143,6 +143,9 @@ VERIFY_TOKEN_TTL_HOURS = int(os.environ.get("VERIFY_TOKEN_TTL_HOURS", "24"))
 VERIFY_CODE_TTL_MINUTES = int(os.environ.get("VERIFY_CODE_TTL_MINUTES", "15"))
 VERIFY_CODE_MAX_ATTEMPTS = int(os.environ.get("VERIFY_CODE_MAX_ATTEMPTS", "5"))
 RESET_TOKEN_TTL_HOURS = int(os.environ.get("RESET_TOKEN_TTL_HOURS", "1"))
+# Password reset now uses a 6-digit code (same UX as email verification).
+RESET_CODE_TTL_MINUTES = int(os.environ.get("RESET_CODE_TTL_MINUTES", "15"))
+RESET_CODE_MAX_ATTEMPTS = int(os.environ.get("RESET_CODE_MAX_ATTEMPTS", "5"))
 # Require a verified email before AI features / premium unlock. Strongly
 # recommended for launch (blocks unverified bots from spending OpenAI credits).
 REQUIRE_EMAIL_VERIFICATION = os.environ.get("REQUIRE_EMAIL_VERIFICATION", "true").lower() == "true"
@@ -161,8 +164,39 @@ SESSION_TTL_DAYS = int(os.environ.get("SESSION_TTL_DAYS", "30"))
 # default to APP_BASE_URL (your production site) rather than a wildcard, so a
 # correctly-configured deployment is locked to the real domain out of the box.
 # Set ALLOWED_ORIGIN="*" explicitly only for local/dev use.
+# A COMMA-SEPARATED list is supported so the live site AND a preview deployment
+# can both call the same backend. Entries may include a WILDCARD subdomain so a
+# staging URL doesn't have to be hard-coded — e.g.
+#   ALLOWED_ORIGIN="https://caloriaclub.com,https://*.netlify.app"
+# matches any <anything>.netlify.app origin (Netlify assigns random subdomains).
 ALLOWED_ORIGIN = (os.environ.get("ALLOWED_ORIGIN", "").strip()
                   or APP_BASE_URL.rstrip("/"))
+ALLOWED_ORIGINS = {o.strip().rstrip("/") for o in ALLOWED_ORIGIN.split(",") if o.strip()}
+
+
+def _origin_matches(origin: str, pattern: str) -> bool:
+    """Exact match, or a single-wildcard host pattern like https://*.netlify.app
+    (prefix + suffix must both match, and the suffix must be dotted so
+    'https://*.netlify.app' can never match 'https://evilnetlify.app')."""
+    if pattern == origin:
+        return True
+    if "*" in pattern:
+        prefix, _, suffix = pattern.partition("*")
+        return (origin.startswith(prefix) and origin.endswith(suffix)
+                and len(origin) >= len(prefix) + len(suffix))
+    return False
+
+
+def cors_origin_for(request_origin: str) -> str:
+    """Which Access-Control-Allow-Origin to return for this request. Reflects the
+    caller's Origin when it matches an allow-listed entry (exact or wildcard);
+    otherwise falls back to the first configured origin. '*' allows any (dev)."""
+    if "*" in ALLOWED_ORIGINS:
+        return "*"
+    ro = (request_origin or "").rstrip("/")
+    if ro and any(_origin_matches(ro, pat) for pat in ALLOWED_ORIGINS):
+        return request_origin
+    return ALLOWED_ORIGIN.split(",")[0].strip()
 # Trust X-Forwarded-For (only enable behind a reverse proxy you control).
 TRUST_PROXY = os.environ.get("TRUST_PROXY", "false").lower() == "true"
 
@@ -205,6 +239,33 @@ ADMIN_EMAILS = {
 
 # No free trials. 0 disables the trial entirely (paid from day one).
 TRIAL_DAYS = int(os.environ.get("TRIAL_DAYS", "0"))
+
+# --- Founding Member badge (private launch) ---
+# The private invite list: accounts that sign up (or log in) with one of these
+# emails receive a PERMANENT Founding Member badge. Paste the invited emails
+# here, comma-separated — that is how you "mark" invited users. Case/spacing
+# insensitive. The badge, once granted, is stored in the DB and never revoked
+# automatically, even if the email is later removed from this list.
+FOUNDING_MEMBER_EMAILS = {
+    e.strip().lower() for e in os.environ.get("FOUNDING_MEMBER_EMAILS", "").split(",") if e.strip()
+}
+# Hard cutoff (UTC, YYYY-MM-DD). After this day ends, the badge can NEVER be
+# auto-granted again — the private launch is closed forever. Blank = no cutoff.
+FOUNDING_MEMBER_DEADLINE = os.environ.get("FOUNDING_MEMBER_DEADLINE", "").strip()
+
+
+def founding_window_open() -> bool:
+    """True while new Founding Member badges may still be granted. Enforces the
+    private-launch cutoff so the badge is genuinely unobtainable afterwards."""
+    if not FOUNDING_MEMBER_DEADLINE:
+        return True
+    import datetime
+    try:
+        deadline = datetime.datetime.strptime(FOUNDING_MEMBER_DEADLINE, "%Y-%m-%d")
+    except ValueError:
+        return True  # misconfigured date must not silently close the window
+    # Allowed through the END of the deadline day (UTC).
+    return datetime.datetime.utcnow() <= deadline + datetime.timedelta(days=1)
 
 # Server-side secret for hashing/session salting. Stable across restarts if set.
 APP_SECRET = os.environ.get("APP_SECRET", "").strip() or secrets.token_hex(32)
