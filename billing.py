@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import secrets
 import time
 import urllib.error
 import urllib.parse
@@ -20,12 +21,19 @@ import db
 
 _API = "https://api.stripe.com/v1"
 
+# Window during which a freshly-created Checkout Session is reused instead of
+# creating another one for the same user+interval. Collapses double-clicks,
+# network retries and back-button re-submits into a single session so we never
+# spin up duplicate Checkout Sessions / PaymentIntents for one payment attempt.
+_CHECKOUT_REUSE_SECONDS = 30 * 60
+
 
 class BillingError(RuntimeError):
     pass
 
 
-def _stripe(path: str, params: dict = None, method: str = "POST") -> dict:
+def _stripe(path: str, params: dict = None, method: str = "POST",
+            idempotency_key: str = None) -> dict:
     if not config.stripe_ready():
         raise BillingError("Billing is not configured (STRIPE_SECRET_KEY missing).")
     headers = {"Authorization": f"Bearer {config.STRIPE_SECRET_KEY}"}
@@ -37,6 +45,10 @@ def _stripe(path: str, params: dict = None, method: str = "POST") -> dict:
     else:
         headers["Content-Type"] = "application/x-www-form-urlencoded"
         data = urllib.parse.urlencode(params or {}, doseq=True).encode()
+        # Idempotency-Key makes a retried POST (network blip, double-submit) return
+        # the SAME object instead of creating a duplicate. Only meaningful on writes.
+        if idempotency_key:
+            headers["Idempotency-Key"] = idempotency_key
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
@@ -57,66 +69,117 @@ def _key_mode() -> str:
     return "live" if config.STRIPE_SECRET_KEY.startswith("sk_live") else "test"
 
 
-def _ensure_price(interval: str, currency: str = "USD") -> str:
-    """Return a Stripe price id for the interval in the requested currency.
+def _ensure_price(interval: str, currency: str = None) -> str:
+    """Return a Stripe Price id for the interval, denominated in `currency`
+    (defaults to the account's BASE_CURRENCY — THB for a Thailand account).
 
-    Resolution order: localized price id for the currency -> USD price id ->
-    legacy single-currency env var -> auto-created USD price. This means a
-    currency without a configured price simply falls back to USD.
-    """
-    currency = config.normalize_currency(currency)
+    Resolution:
+      1) an explicit Price id configured for this currency (STRIPE_PRICE_*_<CUR>)
+      2) for USD only, the legacy single-currency env var (backward compatible)
+      3) an auto-created Price IN THIS CURRENCY, cached per currency+mode.
 
-    # 1) localized price id for the requested currency (e.g. THB/EUR/GBP)
+    Crucially the cache key is scoped by currency, so changing BASE_CURRENCY
+    (e.g. USD → THB) NEVER returns a stale price of the old currency — a fresh
+    price is created in the new currency and the old one is left untouched (so
+    existing subscriptions bound to it keep billing normally)."""
+    currency = config.normalize_currency(currency or config.BASE_CURRENCY)
+
+    # 1) explicit configured Price id for this exact currency
     pid = config.stripe_price_id(interval, currency)
     if pid:
         return pid
-    # 2) fall back to the USD localized price id
-    pid = config.stripe_price_id(interval, "USD")
-    if pid:
-        return pid
-    # 3) legacy single-currency env var (backward compatible)
-    if interval == "monthly" and config.STRIPE_PRICE_MONTHLY:
-        return config.STRIPE_PRICE_MONTHLY
-    if interval == "yearly" and config.STRIPE_PRICE_YEARLY:
-        return config.STRIPE_PRICE_YEARLY
+    # 2) legacy single-currency env var — only meaningful for USD (historical)
+    if currency == "USD":
+        if interval == "monthly" and config.STRIPE_PRICE_MONTHLY:
+            return config.STRIPE_PRICE_MONTHLY
+        if interval == "yearly" and config.STRIPE_PRICE_YEARLY:
+            return config.STRIPE_PRICE_YEARLY
 
-    # 4) auto-create a USD price. Cache keys are scoped to the key mode (live/test)
-    # so a test->live switch creates fresh live objects instead of reusing
-    # incompatible test-mode ids.
+    # 3) auto-create a Price in THIS currency. Cache keys are scoped to
+    # currency+mode so switching currency creates a new price instead of reusing
+    # an incompatible one.
+    # Explicit per-currency prices ($19.99 US, €19.99 EU, £16.99 UK, …) that
+    # override Adaptive Pricing for those markets; Adaptive Pricing converts the
+    # THB base for every other currency. Buyers see their local currency either way.
+    opts = config.price_currency_options(interval, currency)
+
     mode = _key_mode()
-    cached = db.kv_get(f"stripe_price_{interval}_{mode}")
+    # Cache key is scoped by currency AND a signature of the currency_options, so
+    # changing the price definition (currency or the per-market amounts) always
+    # creates a fresh Price instead of returning an incompatible cached one.
+    sig = "-".join(f"{c}{a}" for c, a in sorted(opts.items())) or "single"
+    ckey = f"stripe_price_{interval}_{currency}_{sig}_{mode}"
+    cached = db.kv_get(ckey)
     if cached:
         return cached
 
     product_id = db.kv_get(f"stripe_product_{mode}")
     if not product_id:
-        product = _stripe("products", {"name": "Caloria Premium"})
+        # Idempotency-Key is deterministic so two concurrent first-time checkouts
+        # can't create two "Caloria Premium" products.
+        product = _stripe("products", {"name": "Caloria Premium"},
+                          idempotency_key=f"product_caloria_premium_{mode}")
         product_id = product["id"]
         db.kv_set(f"stripe_product_{mode}", product_id)
 
-    amount = 1999 if interval == "monthly" else 9900
+    amount = config.base_amount(interval, currency)
     recur = "month" if interval == "monthly" else "year"
+    params = {
+        "product": product_id,
+        "unit_amount": amount,
+        "currency": currency.lower(),
+        "recurring[interval]": recur,
+    }
+    for cur, amt in opts.items():
+        params[f"currency_options[{cur.lower()}][unit_amount]"] = amt
     price = _stripe(
-        "prices",
-        {
-            "product": product_id,
-            "unit_amount": amount,
-            "currency": "usd",
-            "recurring[interval]": recur,
-        },
+        "prices", params,
+        idempotency_key=f"price_{interval}_{currency}_{sig}_{mode}",  # no dup prices under races
     )
-    db.kv_set(f"stripe_price_{interval}_{mode}", price["id"])
+    db.kv_set(ckey, price["id"])
     return price["id"]
+
+
+def _pending_key(user_id) -> str:
+    return f"pending_checkout_{user_id}"
+
+
+def clear_pending_checkout(user_id) -> None:
+    """Drop any remembered open Checkout Session for a user (called once they're
+    activated, so a later visit never reuses a spent session)."""
+    try:
+        db.kv_set(_pending_key(user_id), "")
+    except Exception as e:  # noqa: BLE001 — cleanup must never break activation
+        print(f"[caloria] clear pending checkout failed for {user_id}: {e}")
 
 
 def create_checkout(user, interval: str, return_base: str = "") -> str:
     if interval not in ("monthly", "yearly"):
         raise BillingError("Invalid plan interval.")
-    # ONE base price (USD). We never pin a currency here — Stripe Adaptive Pricing
-    # (enabled on the account) automatically presents and charges each customer in
-    # their local currency at checkout. Passing a currency-specific price would
-    # DISABLE Adaptive Pricing, so we deliberately always use the base price.
-    price_id = _ensure_price(interval)
+
+    # ---- de-duplicate: reuse a recent, still-open session for this user+interval
+    # instead of creating a second one. Guards against double-clicks, the browser
+    # back button, and request retries all producing separate Checkout Sessions
+    # (each of which is a separate PaymentIntent the customer's bank could see as a
+    # repeated attempt → card_velocity_exceeded).
+    pkey = _pending_key(user["id"])
+    cached = db.kv_get(pkey)
+    if cached:
+        try:
+            rec = json.loads(cached)
+            if (rec.get("interval") == interval and rec.get("url")
+                    and (time.time() - float(rec.get("ts", 0))) < _CHECKOUT_REUSE_SECONDS):
+                print(f"[caloria] checkout: reusing session {rec.get('session')} for user {user['id']}")
+                return rec["url"]
+        except Exception:  # noqa: BLE001 — a bad cache entry just means "create fresh"
+            pass
+
+    # ONE base price, denominated in the account's settlement currency
+    # (config.BASE_CURRENCY — THB for a Thailand account). Because the price
+    # currency IS a settlement currency, Stripe Adaptive Pricing is eligible and
+    # presents/charges each customer in their own local currency, converting from
+    # the base. We never pin the buyer's currency on the session ourselves.
+    price_id = _ensure_price(interval, config.BASE_CURRENCY)
     # Return to the site the request came from (so a private preview deployment
     # lands back on the preview, not the main domain). Only allow-listed origins
     # are honored — anything else falls back to APP_BASE_URL.
@@ -144,7 +207,22 @@ def create_checkout(user, interval: str, return_base: str = "") -> str:
     # Free trial — no charge until the trial ends; cancel anytime before then.
     if config.TRIAL_DAYS > 0:
         params["subscription_data[trial_period_days]"] = config.TRIAL_DAYS
-    session = _stripe("checkout/sessions", params)
+
+    # Deterministic idempotency key bucketed to the reuse window: two requests that
+    # slip past the cache check at the same instant still collapse to ONE session
+    # at Stripe's side instead of creating duplicates.
+    bucket = int(time.time() // _CHECKOUT_REUSE_SECONDS)
+    idem = f"checkout_{user['id']}_{interval}_{_key_mode()}_{bucket}"
+    session = _stripe("checkout/sessions", params, idempotency_key=idem)
+
+    # Remember it so the very next click reuses this exact session.
+    try:
+        db.kv_set(pkey, json.dumps({
+            "session": session["id"], "url": session["url"],
+            "interval": interval, "ts": time.time(),
+        }))
+    except Exception as e:  # noqa: BLE001 — remembering is best-effort
+        print(f"[caloria] remember pending checkout failed for {user['id']}: {e}")
     return session["url"]
 
 
@@ -180,6 +258,7 @@ def confirm_checkout(user, session_id: str) -> bool:
             "subscribed_at=COALESCE(subscribed_at, ?) WHERE id=?",
             (s.get("customer"), s.get("subscription"), interval, now, user["id"]),
         )
+    clear_pending_checkout(user["id"])
     _log_event("checkout.confirmed", s.get("customer"), "active", user_id=user["id"])
     return True
 
@@ -301,6 +380,7 @@ def handle_event(event: dict) -> None:
                     "subscribed_at=COALESCE(subscribed_at, ?) WHERE id=?",
                     (obj.get("customer"), obj.get("subscription"), interval, now, int(user_id)),
                 )
+            clear_pending_checkout(int(user_id))
 
     elif etype == "customer.subscription.updated":
         # Source of truth for status changes (trial→active, past_due, paused, etc.).

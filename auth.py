@@ -11,7 +11,6 @@ import hashlib
 import json
 import re
 import secrets
-import threading
 
 import config
 import db
@@ -107,7 +106,7 @@ def signup(email: str, password: str, name: str = "") -> dict:
             raise AuthError("An account with that email already exists.", 409)
         raise
     grant_founding_if_invited(user_id, email)  # permanent badge for invited emails
-    sent = send_verification(user_id, email)  # never blocks signup
+    sent = send_verification(user_id, email, context="signup")  # in-request; FIRST email must be reliable
     return {
         "token": _new_session(user_id),
         "user": _public_user(_get_user(user_id)),
@@ -119,29 +118,32 @@ def signup(email: str, password: str, name: str = "") -> dict:
 
 
 # ---------- email verification (6-digit code) ----------
-def send_verification(user_id: int, email: str) -> bool:
-    """Issue a fresh 6-digit verification code (synchronously, so it exists the
-    instant the caller returns) and deliver the email in a background thread so a
-    slow email provider can never block or time out signup/login. The provider
-    call has its own ret/backoff. Returns True once the code is issued and handed
-    off for delivery. Never raises."""
+def send_verification(user_id: int, email: str, context: str = "verify") -> bool:
+    """Issue a fresh 6-digit code and email it — SYNCHRONOUSLY, within the current
+    request. Returns True only if the provider actually accepted the message.
+    `context` ("signup"/"resend"/"login"/…) tags the step-by-step diagnostic log
+    so the FIRST send and a later Resend can be compared line-by-line. Never raises."""
+    import time
+    t0 = time.time()
+    print(f"[verify-trace] {context}: send_verification ENTER user={user_id} email={email}", flush=True)
     try:
         code = tokens.issue_code(user_id, "verify", config.VERIFY_CODE_TTL_MINUTES)
-    except Exception as e:  # noqa: BLE001 — badge/code issues must not break auth
-        print(f"[caloria] verification code issue failed for {email}: {e}")
+    except Exception as e:  # noqa: BLE001 — code issues must not break auth
+        print(f"[verify-trace] {context}: issue_code FAILED {type(e).__name__}: {e}", flush=True)
         return False
+    print(f"[verify-trace] {context}: code issued, email_ready={config.email_ready()}", flush=True)
     if not config.email_ready():
-        print(f"[caloria] verification email NOT sent — email provider not configured ({email})")
+        print(f"[verify-trace] {context}: NOT sent — email provider not configured ({email})", flush=True)
         return False
-
-    def _deliver():
-        try:
-            email_send.send_verification_code(email, code)
-        except Exception as e:  # noqa: BLE001 — email problems must not break the flow
-            print(f"[caloria] verification email failed for {email}: {e}")
-
-    threading.Thread(target=_deliver, name="verify-email", daemon=True).start()
-    return True
+    try:
+        email_send.send_verification_code(
+            email, code, timeout=config.EMAIL_TIMEOUT_INTERACTIVE, trace=context)
+        print(f"[verify-trace] {context}: RESULT sent=True in {int((time.time()-t0)*1000)}ms", flush=True)
+        return True
+    except Exception as e:  # noqa: BLE001 — a failed send must not break signup/login
+        print(f"[verify-trace] {context}: RESULT sent=False {type(e).__name__}: {e} "
+              f"in {int((time.time()-t0)*1000)}ms", flush=True)
+        return False
 
 
 def verify_email_code(email: str, code: str) -> bool:
@@ -164,7 +166,30 @@ def resend_verification(email: str) -> None:
     email = (email or "").strip().lower()
     row = _get_user_by_email(email)
     if row and not row["email_verified"]:
-        send_verification(row["id"], email)
+        send_verification(row["id"], email, context="resend")
+
+
+def change_email(user_id: int, new_email: str) -> str:
+    """Change a user's email (e.g. a typo at signup), reset verification, and send
+    a fresh code to the new address. Returns the normalized new email. Raises
+    AuthError on an invalid or already-taken address."""
+    new_email = (new_email or "").strip().lower()
+    if not _EMAIL_RE.match(new_email):
+        raise AuthError("Please enter a valid email address.")
+    with db.cursor() as c:
+        cur = c.execute("SELECT email FROM users WHERE id = ?", (user_id,)).fetchone()
+        if cur and (cur["email"] or "").lower() == new_email:
+            raise AuthError("That is already your email address.")
+        taken = c.execute(
+            "SELECT id FROM users WHERE email = ? AND id <> ?", (new_email, user_id)
+        ).fetchone()
+        if taken:
+            raise AuthError("An account with that email already exists.", 409)
+        # New address starts unverified — this is the whole point of the gate.
+        c.execute("UPDATE users SET email = ?, email_verified = 0 WHERE id = ?",
+                  (new_email, user_id))
+    send_verification(user_id, new_email, context="change_email")
+    return new_email
 
 
 # ---------- password reset (6-digit code, same UX as email verification) ----------
@@ -235,7 +260,7 @@ def login(email: str, password: str) -> dict:
     # the login itself is what surfaces the verification modal, so the very first
     # request must deliver a code (previously none was sent until "Resend").
     if config.REQUIRE_EMAIL_VERIFICATION and not is_verified(row):
-        send_verification(row["id"], email)
+        send_verification(row["id"], email, context="login")
     return {"token": _new_session(row["id"]), "user": _public_user(row)}
 
 

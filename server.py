@@ -165,7 +165,7 @@ class Handler(BaseHTTPRequestHandler):
     _PUBLIC_PATHS = frozenset({
         "/api/health", "/api/config", "/api/me",
         "/api/auth/signup", "/api/auth/login", "/api/auth/logout",
-        "/api/auth/verify-code", "/api/auth/resend",
+        "/api/auth/verify-code", "/api/auth/resend", "/api/auth/change-email",
         "/api/auth/forgot", "/api/auth/reset", "/api/auth/reset-check",
         "/api/billing/checkout", "/api/billing/portal",
         "/api/billing/webhook", "/api/billing/status",
@@ -193,6 +193,17 @@ class Handler(BaseHTTPRequestHandler):
         u = self._user()
         if not u:
             self._send(401, {"error": "Please sign in.", "auth": True})
+            return False
+        # MANDATORY email verification — enforced centrally, BEFORE the onboarding
+        # funnel or any premium feature. An unverified account can only reach the
+        # handful of _PUBLIC_PATHS above (its own /api/me, verify-code, resend,
+        # change-email, logout). There is no app route it can touch until
+        # email_verified == true, so verification cannot be bypassed from any client.
+        if config.REQUIRE_EMAIL_VERIFICATION and not auth.is_verified(u):
+            self._send(403, {
+                "error": "Please verify your email to continue.",
+                "needs_verification": True,
+            })
             return False
         # Onboarding funnel: authentication is enough (no premium yet). Real premium
         # features are NOT in this set and remain gated below.
@@ -240,8 +251,11 @@ class Handler(BaseHTTPRequestHandler):
                 "stripe_configured": config.stripe_ready(),
                 "images_enabled": images.available(),
                 "free_scan_limit": config.FREE_SCAN_LIMIT,
-                # Base price shown on the pricing page. Stripe Adaptive Pricing
-                # converts to each customer's local currency at checkout.
+                # Product anchor price shown on the marketing page ($19.99 / $99).
+                # At Checkout, Stripe presents each buyer their own local currency:
+                # exact currency_options amounts for US/EU/UK, Adaptive Pricing
+                # converts the base for everywhere else. THB is only the internal
+                # settlement currency and is never shown to US/EU/UK customers.
                 "price_monthly": config.PRICE_MONTHLY_DISPLAY,
                 "price_yearly": config.PRICE_YEARLY_DISPLAY,
                 "trial_days": config.TRIAL_DAYS,
@@ -562,6 +576,7 @@ class Handler(BaseHTTPRequestHandler):
             "/api/ritual/freeze": self._ritual_freeze,
             "/api/notifications/seen": self._notifications_seen,
             "/api/workout/complete": self._workout_complete,
+            "/api/auth/change-email": self._change_email,
             "/api/billing/checkout": self._checkout,
             "/api/billing/confirm": self._billing_confirm,
             "/api/billing/portal": self._billing_portal,
@@ -637,6 +652,22 @@ class Handler(BaseHTTPRequestHandler):
         email = u["email"] if u else str(data.get("email", ""))
         auth.resend_verification(email)
         self._send(200, {"ok": True})
+
+    def _change_email(self, data):
+        """Let a signed-in (typically UNVERIFIED) user correct the email they
+        signed up with, then re-send a fresh code to the new address. Requires the
+        account's own session token, so it can only change your own email."""
+        if self._rate_limited("change_email", self._client_ip()):
+            return
+        u = self._require_user()
+        if not u:
+            return
+        try:
+            new_email = auth.change_email(u["id"], data.get("email", ""))
+        except auth.AuthError as e:
+            return self._send(e.code, {"error": e.message})
+        self._send(200, {"ok": True, "email": new_email,
+                         "user": auth.public_user(self._user())})
 
     def _forgot_password(self, data):
         if self._rate_limited("forgot", self._client_ip()):
@@ -1220,7 +1251,18 @@ def main():
     print(f"  OpenAI: {'configured' if config.openai_ready() else 'NOT configured'} "
           f"(vision: {config.OPENAI_VISION_MODEL}, text: {config.OPENAI_TEXT_MODEL})")
     print(f"  USDA:   {'DEMO_KEY (rate-limited)' if config.USDA_API_KEY == 'DEMO_KEY' else 'configured'}")
-    print(f"  Stripe: {'configured' if config.stripe_ready() else 'NOT configured'}")
+    if config.stripe_ready():
+        mode = billing._key_mode()
+        print(f"  Stripe: configured ({mode} mode)")
+        prod = "caloriaclub.com" in (config.APP_BASE_URL or "")
+        if prod and mode == "test":
+            print("  [WARNING] Production APP_BASE_URL with a TEST Stripe key — real "
+                  "payments will fail. Use sk_live_… and live Price IDs in production.")
+        elif not prod and mode == "live":
+            print("  [WARNING] LIVE Stripe key on a non-production APP_BASE_URL — this can "
+                  "create REAL charges. Use sk_test_… outside production.")
+    else:
+        print("  Stripe: NOT configured")
     print(f"  Email:  {'Resend configured' if config.email_ready() else 'NOT configured (links logged to console)'}")
     print(f"  Turnstile: {'on' if turnstile.enabled() else 'off (rate-limit only)'}")
     print(f"  Verify required: {config.REQUIRE_EMAIL_VERIFICATION}  |  DEV_UNLIMITED: {config.DEV_UNLIMITED}")

@@ -29,10 +29,15 @@ class EmailError(RuntimeError):
 
 
 def _send(to: str, subject: str, html: str, text: str,
-          headers: dict | None = None) -> str | None:
+          headers: dict | None = None, timeout: int | None = None,
+          trace: str | None = None) -> str | None:
     """Send one email via Resend. Returns the Resend message id on success (and
     logs it for a delivery audit trail), or None in the dev/console fallback.
-    `headers` adds custom SMTP headers (e.g. List-Unsubscribe for bulk sends)."""
+    `headers` adds custom SMTP headers (e.g. List-Unsubscribe for bulk sends).
+    `timeout` overrides the per-attempt socket timeout (used by the inline
+    verification path so a signup request can't hang on a slow provider).
+    `trace` (e.g. "signup"/"resend") turns on step-by-step diagnostic logging so
+    the exact Resend request/response/error for that send is visible in the logs."""
     if not config.email_ready():
         # Dev fallback — surface the message so the flow is testable without a key.
         print(f"[caloria][EMAIL:dev] to={to} subject={subject!r}\n{text}\n")
@@ -62,19 +67,33 @@ def _send(to: str, subject: str, html: str, text: str,
     )
     body = None
     last_err = None
+    per_attempt_timeout = timeout or config.EMAIL_TIMEOUT
+    if trace:
+        print(f"[verify-trace] {trace}: POST {_RESEND_URL} to={to} from={config.EMAIL_FROM} "
+              f"attempts={_SEND_ATTEMPTS} timeout={per_attempt_timeout}s", flush=True)
     for attempt in range(_SEND_ATTEMPTS):
+        t0 = time.time()
         try:
-            resp = urllib.request.urlopen(req, timeout=config.EMAIL_TIMEOUT)
+            resp = urllib.request.urlopen(req, timeout=per_attempt_timeout)
             body = resp.read().decode("utf-8", "ignore")
+            if trace:
+                print(f"[verify-trace] {trace}: attempt {attempt+1} OK http={resp.getcode()} "
+                      f"in {int((time.time()-t0)*1000)}ms", flush=True)
             break
         except urllib.error.HTTPError as e:
             detail = e.read().decode("utf-8", "ignore")[:200]
+            if trace:
+                print(f"[verify-trace] {trace}: attempt {attempt+1} HTTPError code={e.code} "
+                      f"in {int((time.time()-t0)*1000)}ms body={detail!r}", flush=True)
             # 4xx (bad key, invalid address, …) are permanent — fail fast. Only
             # 429 and 5xx are worth retrying.
             if e.code < 500 and e.code != 429:
                 raise EmailError(f"Email provider error {e.code}: {detail}") from e
             last_err = EmailError(f"Email provider error {e.code}: {detail}")
         except urllib.error.URLError as e:  # DNS/TLS/connection reset/timeout
+            if trace:
+                print(f"[verify-trace] {trace}: attempt {attempt+1} URLError reason={e.reason!r} "
+                      f"({type(e.reason).__name__}) in {int((time.time()-t0)*1000)}ms", flush=True)
             last_err = EmailError(f"Could not reach email provider: {e.reason}")
         if attempt < _SEND_ATTEMPTS - 1:
             time.sleep(_RETRY_BACKOFF * (attempt + 1))
@@ -125,7 +144,8 @@ def send_verification(to: str, link: str) -> None:
     _send(to, "Confirm your Caloria email", html, text)
 
 
-def send_verification_code(to: str, code: str) -> None:
+def send_verification_code(to: str, code: str, timeout: int | None = None,
+                           trace: str | None = None) -> None:
     code_html = (
         '<div style="font-family:-apple-system,Segoe UI,sans-serif;font-size:34px;'
         'font-weight:700;letter-spacing:10px;color:#2a2230;background:#fff;'
@@ -143,7 +163,7 @@ def send_verification_code(to: str, code: str) -> None:
         f"Welcome to Caloria! Your email verification code is: {code}\n"
         f"It expires in {config.VERIFY_CODE_TTL_MINUTES} minutes. Don't share it with anyone."
     )
-    _send(to, "Your Caloria verification code", html, text)
+    _send(to, "Your Caloria verification code", html, text, timeout=timeout, trace=trace)
 
 
 def _open(label="Open Caloria"):

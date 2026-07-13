@@ -103,6 +103,72 @@ def currency_for_country(country: str) -> str:
     return _COUNTRY_CURRENCY.get((country or "").upper(), "USD")
 
 
+# --- Base currency for NEW checkouts --------------------------------------
+# Stripe Adaptive Pricing only converts a price whose currency is one of your
+# SETTLEMENT currencies. A Thailand account settles in THB, so the base price
+# must be THB — Stripe then presents/charges each buyer in their own local
+# currency, converting from THB. Change via env only if your settlement currency
+# changes; setting BASE_CURRENCY=USD reverts to the previous behaviour.
+BASE_CURRENCY = os.environ.get("BASE_CURRENCY", "THB").upper()
+if BASE_CURRENCY not in SUPPORTED_CURRENCIES:
+    BASE_CURRENCY = "USD"
+
+# Amount (in the currency's smallest unit) used ONLY when auto-creating a base
+# price and no explicit Stripe Price id is set. Override per market via env, e.g.
+# PRICE_MONTHLY_THB_AMOUNT=69900  (satang → ฿699.00).
+_BASE_AMOUNTS = {
+    "USD": {"monthly": 1999,  "yearly": 9900},
+    "THB": {"monthly": 69900, "yearly": 349900},   # ฿699 / ฿3,499
+    "EUR": {"monthly": 1999,  "yearly": 9900},
+    "GBP": {"monthly": 1699,  "yearly": 8400},
+}
+
+
+def base_amount(interval: str, currency: str) -> int:
+    currency = normalize_currency(currency)
+    default = _BASE_AMOUNTS.get(currency, _BASE_AMOUNTS["USD"]).get(interval, 0)
+    try:
+        return int(os.environ.get(f"PRICE_{interval.upper()}_{currency}_AMOUNT", default))
+    except ValueError:
+        return default
+
+
+# Explicit per-currency prices attached to the base Price via Stripe
+# `currency_options`. These OVERRIDE Adaptive Pricing for the listed currencies,
+# so customers in those regions pay THIS EXACT amount (US = $19.99, never an FX
+# conversion), while Adaptive Pricing converts the base for every OTHER currency.
+# Amounts are in each currency's smallest unit; override any via env, e.g.
+# PRICE_MONTHLY_EUR_AMOUNT=1899.
+_CURRENCY_OPTION_AMOUNTS = {
+    "monthly": {"USD": 1999, "EUR": 1999, "GBP": 1699},
+    "yearly":  {"USD": 9900, "EUR": 9900, "GBP": 8400},
+}
+
+
+def price_currency_options(interval: str, base_currency: str) -> dict:
+    """Explicit per-currency amounts for `interval`, EXCLUDING the base currency
+    (Stripe rejects a currency_option that equals the price's own currency).
+    Returns {CUR: amount}. Env-overridable per currency."""
+    base = normalize_currency(base_currency)
+    out = {}
+    for cur, amt in _CURRENCY_OPTION_AMOUNTS.get(interval, {}).items():
+        cur = cur.upper()
+        if cur == base:
+            continue
+        try:
+            out[cur] = int(os.environ.get(f"PRICE_{interval.upper()}_{cur}_AMOUNT", amt))
+        except ValueError:
+            out[cur] = amt
+    return out
+
+
+def base_display() -> dict:
+    """Monthly/yearly display strings for the BASE_CURRENCY (shown pre-checkout)."""
+    disp = currency_display()
+    d = disp.get(BASE_CURRENCY, disp["USD"])
+    return {"symbol": d["symbol"], "monthly": d["monthly"], "yearly": d["yearly"]}
+
+
 def currency_display() -> dict:
     """Per-currency symbol + monthly/yearly display strings for the UI."""
     out = {}
@@ -138,6 +204,11 @@ EMAIL_REPLY_TO = os.environ.get("EMAIL_REPLY_TO", "").strip()
 # Version of the Terms/Privacy a user accepts at signup (for consent evidence).
 POLICY_VERSION = os.environ.get("POLICY_VERSION", "2026-06-17").strip()
 EMAIL_TIMEOUT = int(os.environ.get("EMAIL_TIMEOUT", "15"))
+# Shorter per-attempt timeout for emails sent INLINE during a signup/login/resend
+# request (verification codes). Keeps the request from hanging if the provider is
+# slow, while the send still completes in-request (not a fire-and-forget thread
+# that a suspended instance could drop). Normal sends return in well under 1s.
+EMAIL_TIMEOUT_INTERACTIVE = int(os.environ.get("EMAIL_TIMEOUT_INTERACTIVE", "8"))
 VERIFY_TOKEN_TTL_HOURS = int(os.environ.get("VERIFY_TOKEN_TTL_HOURS", "24"))
 # 6-digit email verification code: lifetime and max wrong attempts before it's burned.
 VERIFY_CODE_TTL_MINUTES = int(os.environ.get("VERIFY_CODE_TTL_MINUTES", "15"))
