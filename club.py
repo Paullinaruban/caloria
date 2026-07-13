@@ -755,9 +755,60 @@ def _campaign_early_access(first_name: str, recipient_email: str = "") -> dict:
     }
 
 
+def _campaign_followup(first_name: str, recipient_email: str = "") -> dict:
+    url = config.APP_BASE_URL.rstrip("/") + "/"   # the Founding Members signup page
+    perks = "".join(
+        f'<tr><td style="padding:5px 0;font-size:16px;line-height:1.5">'
+        f'<span style="color:#f24d8c">•</span>&nbsp; {p}</td></tr>'
+        for p in ["Your exclusive Founding Member badge",
+                  "Lifetime recognition as one of the very first members",
+                  "Early access before the public launch",
+                  "Founding Member perks &amp; pricing, locked in"]
+    )
+    inner = f"""\
+   <h1 style="font-family:{_SERIF};font-size:28px;font-weight:600;letter-spacing:-.015em;text-align:center;margin:0 0 24px;line-height:1.2">Your invitation is still waiting 🤍</h1>
+   <p style="font-size:16px;line-height:1.75;margin:0 0 16px">Hi {first_name},</p>
+   <p style="font-size:16px;line-height:1.75;margin:0 0 16px">A few days ago I sent you your private invitation to <b>Caloria Club</b> — but I noticed you haven't opened it yet, and I didn't want you to miss your place.</p>
+   <div style="background:#fff5fa;border:1px solid #ffd7e7;border-radius:14px;padding:14px 16px;margin:0 0 18px">
+     <p style="font-size:14.5px;line-height:1.6;margin:0;color:#8a5a72">💌 <b>Didn't see my first email?</b> Please check your <b>Spam</b>, <b>Promotions</b> and <b>Updates</b> folders — it sometimes hides there. Your private invitation link is inside.</p>
+   </div>
+   <p style="font-size:16px;line-height:1.75;margin:0 0 16px">Your Founding Member spot is <b>still reserved</b> — but only until enrollment closes.</p>
+   <p style="font-size:16px;line-height:1.6;margin:0 0 8px;font-weight:700">As a Founding Member you receive:</p>
+   <table style="width:100%;border-collapse:collapse;margin:0 0 18px">{perks}</table>
+   <p style="font-size:16px;line-height:1.75;margin:0 0 22px;background:#fdeef6;border-radius:12px;padding:14px 16px;text-align:center;color:#a3244f;font-weight:600">⏳ Founding Members enrollment closes <b>July 15</b>.<br>After that, this opportunity is gone for good.</p>
+   <p style="text-align:center;margin:0 0 26px"><a href="{url}" {_CAMPAIGN_BTN}>Join Caloria Club</a></p>
+   <p style="font-size:16px;line-height:1.75;margin:0 0 6px">You were one of the first women to believe in this — I'd love for you to be one of the first inside. Don't miss your chance.</p>
+   <p style="font-size:16px;line-height:1.75;margin:0">With love,<br>— Polina 🤍</p>"""
+    text = (
+        f"Hi {first_name},\n\n"
+        "A few days ago I sent you your private invitation to Caloria Club — but I noticed "
+        "you haven't opened it yet, and I didn't want you to miss your place.\n\n"
+        "Didn't see my first email? Please check your Spam, Promotions and Updates folders "
+        "— it sometimes hides there. Your private invitation link is inside.\n\n"
+        "Your Founding Member spot is still reserved — but only until enrollment closes.\n\n"
+        "As a Founding Member you receive:\n"
+        "  • Your exclusive Founding Member badge\n"
+        "  • Lifetime recognition as one of the very first members\n"
+        "  • Early access before the public launch\n"
+        "  • Founding Member perks & pricing, locked in\n\n"
+        "Founding Members enrollment closes July 15. After that, this opportunity is gone for good.\n\n"
+        f"Join Caloria Club: {url}\n\n"
+        "You were one of the first women to believe in this — I'd love for you to be one of the "
+        "first inside. Don't miss your chance.\n\nWith love,\n— Polina 🤍"
+    )
+    return {
+        "subject": "⏳ Your private invitation is still waiting (closes July 15)",
+        "html": _campaign_shell("Your Founding Member invitation closes July 15.", "✦ Founding Members", inner, recipient_email),
+        "text": text,
+    }
+
+
 CAMPAIGNS = {
     "tomorrow": {"label": "Tomorrow", "subject": "✨ Tomorrow.", "render": _campaign_tomorrow},
     "early_access": {"label": "Early Access", "subject": "✨ Your invitation is here.", "render": _campaign_early_access},
+    "followup": {"label": "Follow-up Early Access",
+                 "subject": "⏳ Your private invitation is still waiting (closes July 15)",
+                 "render": _campaign_followup},
 }
 
 
@@ -808,6 +859,39 @@ def send_campaign(kind: str) -> dict:
         update_id = c.lastrowid
     _launch_broadcast(update_id)
     return {"id": update_id, "total": info["recipients"], "skipped": info["skipped"], "status": "sending"}
+
+
+def preview_campaign(kind: str, sample_email: str = "") -> dict:
+    """Render a pre-built campaign EXACTLY as members receive it (same template,
+    branding, buttons) for the admin preview iframe. Sends nothing."""
+    if kind not in CAMPAIGNS:
+        raise ClubError("Unknown campaign.")
+    to = (sample_email or "").strip().lower()
+    with db.cursor() as c:
+        fname = _first_name(c, to) if to else "beautiful"
+    built = CAMPAIGNS[kind]["render"](fname, to or "preview@caloriaclub.com")
+    return {"kind": kind, "label": CAMPAIGNS[kind]["label"],
+            "subject": built["subject"], "html": built["html"]}
+
+
+def test_campaign(kind: str, to: str) -> dict:
+    """Send ONE copy of a pre-built campaign to the admin only — identical to what
+    members get. NOT recorded in club_campaign_sends, so it never affects the
+    real send's duplicate protection and can be re-sent freely."""
+    if kind not in CAMPAIGNS:
+        raise ClubError("Unknown campaign.")
+    if not config.email_ready():
+        raise ClubError("Resend is not configured — set RESEND_API_KEY first.", 503)
+    to = (to or "").strip().lower()
+    if not _EMAIL_RE.match(to):
+        raise ClubError("No valid admin email to send the test to.")
+    with db.cursor() as c:
+        fname = _first_name(c, to)
+    built = CAMPAIGNS[kind]["render"](fname, to)
+    email_send._send(to, "[TEST] " + built["subject"], built["html"], built["text"],
+                     headers=_unsub_headers(to))
+    _bump_email_counter()
+    return {"ok": True, "test_sent_to": to, "label": CAMPAIGNS[kind]["label"]}
 
 
 # ---------- admin ----------

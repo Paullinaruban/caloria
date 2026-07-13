@@ -584,6 +584,8 @@ class Handler(BaseHTTPRequestHandler):
             "/api/club/answers": self._club_answers,
             "/api/club/admin/send-update": self._club_send_update,
             "/api/club/admin/send-campaign": self._club_send_campaign,
+            "/api/club/admin/test-campaign": self._club_test_campaign,
+            "/api/club/admin/preview-campaign": self._club_preview_campaign,
             "/api/club/admin/test-update": self._club_test_update,
             "/api/club/admin/preview-update": self._club_preview_update,
             "/api/club/admin/resume-update": self._club_resume_update,
@@ -1031,6 +1033,33 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             res = club.send_campaign(str(data.get("kind", "")))
+        except club.ClubError as e:
+            return self._send(e.code, {"error": e.message})
+        self._send(200, res)
+
+    def _club_test_campaign(self, data):
+        """Send ONE copy of a pre-built campaign (e.g. Follow-up) to the signed-in
+        admin only — never logged as a campaign, so it doesn't affect dedup."""
+        u = self._require_admin()
+        if not u:
+            return
+        try:
+            res = club.test_campaign(str(data.get("kind", "")), u["email"])
+        except club.ClubError as e:
+            return self._send(e.code, {"error": e.message})
+        except Exception as e:  # noqa: BLE001 — surface provider errors cleanly
+            print(f"[caloria][club] campaign test email failed: {e}")
+            return self._send(503, {"error": "The test email could not be sent. Please try again."})
+        self._send(200, res)
+
+    def _club_preview_campaign(self, data):
+        """Render a pre-built campaign exactly as members receive it (for the
+        admin preview iframe). Sends nothing."""
+        u = self._require_admin()
+        if not u:
+            return
+        try:
+            res = club.preview_campaign(str(data.get("kind", "")), u["email"])
         except club.ClubError as e:
             return self._send(e.code, {"error": e.message})
         self._send(200, res)
