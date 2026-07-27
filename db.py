@@ -118,6 +118,13 @@ def init_db() -> None:
         _add_column(c, "users", "plan_interval", "TEXT")           # monthly|yearly (captured at checkout)
         _add_column(c, "users", "subscribed_at", "TEXT")           # ISO ts of first paid checkout
         _add_column(c, "users", "active", "INTEGER NOT NULL DEFAULT 1")  # admin can deactivate
+        # --- In-App Purchase (RevenueCat) — iOS now, Google Play later. Kept
+        # separate from the Stripe columns so the two billing sources never
+        # clobber each other; access is still the single `plan` flag. ---
+        _add_column(c, "users", "iap_provider", "TEXT")            # app_store|play_store
+        _add_column(c, "users", "iap_active", "INTEGER NOT NULL DEFAULT 0")
+        _add_column(c, "users", "iap_product", "TEXT")             # product identifier
+        _add_column(c, "users", "iap_expires_at", "TEXT")          # ISO ts of current period end
         # Founding Member badge (private launch) — permanent once set. See
         # config.FOUNDING_MEMBER_EMAILS and auth.grant_founding_if_invited().
         _add_column(c, "users", "founding_member", "INTEGER NOT NULL DEFAULT 0")

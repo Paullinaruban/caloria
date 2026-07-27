@@ -271,10 +271,11 @@ def analytics() -> dict:
             (period,),
         ).fetchone()
 
-    # Interval-accurate revenue: monthly subs bill $19.99/mo, yearly subs bill
-    # $99/yr (≈ $8.25/mo of MRR). Subscribers whose interval predates this
+    # Interval-accurate revenue, driven by the single pricing source of truth:
+    # monthly subs bill config.MONTHLY_PRICE_USD/mo, yearly subs bill
+    # config.YEARLY_PRICE_USD/yr. Subscribers whose interval predates this
     # tracking fall back to the flat per-subscriber estimate so MRR never dips.
-    _MONTHLY_PRICE, _YEARLY_PRICE = 19.99, 99.0
+    _MONTHLY_PRICE, _YEARLY_PRICE = float(config.MONTHLY_PRICE_USD), float(config.YEARLY_PRICE_USD)
     known = monthly_subs + yearly_subs
     unknown = max(0, paying - known)
     mrr = round(

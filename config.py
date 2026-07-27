@@ -48,10 +48,103 @@ USDA_DATA_TYPES = ["Foundation", "SR Legacy"]  # reliable per-100g profiles
 # --- Stripe subscriptions ---
 STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY", "").strip()
 STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "").strip()
-STRIPE_PRICE_MONTHLY = os.environ.get("STRIPE_PRICE_MONTHLY", "").strip()  # price_... (legacy, USD)
-STRIPE_PRICE_YEARLY = os.environ.get("STRIPE_PRICE_YEARLY", "").strip()
-PRICE_MONTHLY_DISPLAY = "$19.99"
-PRICE_YEARLY_DISPLAY = "$99"
+# Explicit Stripe Price ids (price_...). When set, checkout uses EXACTLY that Price
+# and OVERRIDES auto-creation. For the time-limited promo you can set TWO monthly
+# ids and the code auto-switches at PROMO_END_UTC; or leave them blank and the
+# Price auto-creates from the amount below (which ALSO auto-reverts). See
+# explicit_price_id() and billing.create_checkout().
+STRIPE_PRICE_MONTHLY         = os.environ.get("STRIPE_PRICE_MONTHLY", "").strip()          # legacy single monthly id
+STRIPE_PRICE_MONTHLY_PROMO   = os.environ.get("STRIPE_PRICE_MONTHLY_PROMO", "").strip()    # $15 promo price id (optional)
+STRIPE_PRICE_MONTHLY_REGULAR = os.environ.get("STRIPE_PRICE_MONTHLY_REGULAR", "").strip()  # $19.99 regular price id (optional)
+STRIPE_PRICE_YEARLY          = os.environ.get("STRIPE_PRICE_YEARLY", "").strip()           # yearly id
+
+# ============================================================================
+# SUBSCRIPTION PRICING — SINGLE SOURCE OF TRUTH (time-limited promo)
+# ----------------------------------------------------------------------------
+# Monthly is the PROMO price ($15) until PROMO_END_UTC, then AUTOMATICALLY returns
+# to the REGULAR price ($19.99) with NO redeploy. Every surface — display strings,
+# the Stripe amount in every currency, /api/config, the landing hero/paywalls, and
+# admin MRR — reads the helpers below, so the switch happens everywhere at once.
+# Everything is env-overridable. Yearly is fixed.
+# ============================================================================
+import datetime as _dt
+
+MONTHLY_PROMO_USD   = float(os.environ.get("MONTHLY_PROMO_USD", "15"))       # apology / launch offer
+MONTHLY_REGULAR_USD = float(os.environ.get("MONTHLY_REGULAR_USD", "19.99"))  # normal price after the promo
+YEARLY_PRICE_USD    = float(os.environ.get("YEARLY_PRICE_USD", "99"))
+# Promo runs THROUGH this UTC instant; the moment it passes, monthly auto-reverts.
+PROMO_END_UTC = os.environ.get("PROMO_END_UTC", "2026-08-05T23:59:59Z").strip()
+
+
+def promo_active(now=None) -> bool:
+    """True while the $15 promo is running; False once PROMO_END_UTC has passed."""
+    if not PROMO_END_UTC:
+        return False
+    try:
+        end = _dt.datetime.strptime(PROMO_END_UTC, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=_dt.timezone.utc)
+    except ValueError:
+        return True  # misconfigured deadline → fail safe to the cheaper promo price
+    return (now or _dt.datetime.now(_dt.timezone.utc)) <= end
+
+
+def monthly_price_usd(now=None) -> float:
+    """Current monthly price in USD — promo until the deadline, then regular."""
+    return MONTHLY_PROMO_USD if promo_active(now) else MONTHLY_REGULAR_USD
+
+
+def _fmt_price(symbol, amt) -> str:
+    """'$15' for whole amounts, '$19.99' when cents are present."""
+    return f"{symbol}{int(amt)}" if float(amt).is_integer() else f"{symbol}{amt:.2f}"
+
+
+# Per-USD multiplier to derive each market's MONTHLY amount from the USD price.
+_MONTHLY_FX_PER_USD = {"USD": 1.0, "EUR": 1.0, "GBP": 1.0, "THB": 35.0}
+_YEARLY_MINOR = {"USD": 9900, "THB": 349900, "EUR": 9900, "GBP": 8400}
+
+
+def _monthly_minor_units(currency: str, now=None) -> int:
+    """Current monthly amount in the currency's smallest unit (auto-reverts)."""
+    amt = monthly_price_usd(now) * _MONTHLY_FX_PER_USD.get(currency, 1.0)
+    minor = amt * 100
+    if currency == "THB":                 # keep THB to whole baht
+        minor = round(minor / 100) * 100
+    return int(round(minor))
+
+
+def price_monthly_display(now=None) -> str:
+    return _fmt_price("$", monthly_price_usd(now))
+
+
+def price_monthly_compare_display(now=None):
+    """Struck-through 'was' price shown WHILE the promo is on ($19.99); None after."""
+    return _fmt_price("$", MONTHLY_REGULAR_USD) if promo_active(now) else None
+
+
+PRICE_YEARLY_DISPLAY = _fmt_price("$", YEARLY_PRICE_USD)   # "$99" (static)
+
+
+# Back-compat: keep the old module attribute names working, resolved LIVE so the
+# promo reversion needs no redeploy (PEP 562 module __getattr__).
+def __getattr__(name):
+    if name == "MONTHLY_PRICE_USD":
+        return monthly_price_usd()
+    if name == "PRICE_MONTHLY_DISPLAY":
+        return price_monthly_display()
+    if name == "PRICE_MONTHLY_COMPARE_DISPLAY":
+        return price_monthly_compare_display()
+    if name == "MONTHLY_COMPARE_USD":
+        return MONTHLY_REGULAR_USD
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+# --- RevenueCat (Apple In-App Purchase now; Google Play later) ---
+# The Apple *public* SDK key (starts with "appl_") is safe to expose to the app
+# and is served to it via /api/config. The *secret* v1 REST key and the webhook
+# Authorization value are server-only — never send them to the client.
+REVENUECAT_APPLE_KEY   = os.environ.get("REVENUECAT_APPLE_KEY", "").strip()    # appl_... (public SDK key, iOS)
+REVENUECAT_GOOGLE_KEY  = os.environ.get("REVENUECAT_GOOGLE_KEY", "").strip()   # goog_... (public SDK key, Android — later)
+REVENUECAT_SECRET_KEY  = os.environ.get("REVENUECAT_SECRET_KEY", "").strip()   # sk_... server REST key (verify + read)
+REVENUECAT_WEBHOOK_AUTH = os.environ.get("REVENUECAT_WEBHOOK_AUTH", "").strip()# shared secret you set as the webhook Authorization header
+REVENUECAT_ENTITLEMENT = os.environ.get("REVENUECAT_ENTITLEMENT", "premium").strip()  # entitlement id in RevenueCat
 
 # --- Multi-currency pricing (USD, THB, EUR, GBP) ---
 # Localized Stripe Price ids per currency + interval. Create these prices in your
@@ -68,16 +161,6 @@ STRIPE_PRICE_IDS = {
     ("yearly",  "EUR"): os.environ.get("STRIPE_PRICE_YEARLY_EUR", "").strip(),
     ("monthly", "GBP"): os.environ.get("STRIPE_PRICE_MONTHLY_GBP", "").strip(),
     ("yearly",  "GBP"): os.environ.get("STRIPE_PRICE_YEARLY_GBP", "").strip(),
-}
-
-# Display strings shown BEFORE checkout (the real charge comes from the Stripe
-# Price object). Overridable via env so they match what you configured in Stripe,
-# e.g. PRICE_MONTHLY_THB_DISPLAY=฿699.
-_CURRENCY_DISPLAY_DEFAULTS = {
-    "USD": ("$", "$19.99", "$99"),
-    "THB": ("฿", "฿699",   "฿3,499"),
-    "EUR": ("€", "€19.99", "€99"),
-    "GBP": ("£", "£16.99", "£84"),
 }
 
 # Rough country -> default-currency map (used when the client sends a country
@@ -99,6 +182,21 @@ def stripe_price_id(interval: str, currency: str) -> str:
     return STRIPE_PRICE_IDS.get((interval, normalize_currency(currency)), "")
 
 
+def explicit_price_id(interval: str, now=None) -> str:
+    """Explicit Stripe Price id to use for checkout (overrides auto-creation).
+    Monthly auto-switches promo→regular at PROMO_END_UTC. Returns '' → the Price
+    auto-creates from the current amount (which also auto-reverts). To pin explicit
+    Dashboard-managed prices WITH auto-revert, set STRIPE_PRICE_MONTHLY_PROMO and
+    STRIPE_PRICE_MONTHLY_REGULAR."""
+    if interval == "yearly":
+        return STRIPE_PRICE_YEARLY
+    if interval == "monthly":
+        if promo_active(now):
+            return STRIPE_PRICE_MONTHLY_PROMO or STRIPE_PRICE_MONTHLY
+        return STRIPE_PRICE_MONTHLY_REGULAR   # empty after promo → auto-create $19.99
+    return ""
+
+
 def currency_for_country(country: str) -> str:
     return _COUNTRY_CURRENCY.get((country or "").upper(), "USD")
 
@@ -114,19 +212,15 @@ if BASE_CURRENCY not in SUPPORTED_CURRENCIES:
     BASE_CURRENCY = "USD"
 
 # Amount (in the currency's smallest unit) used ONLY when auto-creating a base
-# price and no explicit Stripe Price id is set. Override per market via env, e.g.
-# PRICE_MONTHLY_THB_AMOUNT=69900  (satang → ฿699.00).
-_BASE_AMOUNTS = {
-    "USD": {"monthly": 1999,  "yearly": 9900},
-    "THB": {"monthly": 69900, "yearly": 349900},   # ฿699 / ฿3,499
-    "EUR": {"monthly": 1999,  "yearly": 9900},
-    "GBP": {"monthly": 1699,  "yearly": 8400},
-}
-
-
-def base_amount(interval: str, currency: str) -> int:
+# price and no explicit Stripe Price id is set. Monthly derives from the CURRENT
+# monthly price (auto-reverts at PROMO_END_UTC); yearly is fixed. Override per
+# market via env, e.g. PRICE_MONTHLY_THB_AMOUNT=52500 (satang → ฿525.00).
+def base_amount(interval: str, currency: str, now=None) -> int:
     currency = normalize_currency(currency)
-    default = _BASE_AMOUNTS.get(currency, _BASE_AMOUNTS["USD"]).get(interval, 0)
+    if interval == "monthly":
+        default = _monthly_minor_units(currency, now)
+    else:
+        default = _YEARLY_MINOR.get(currency, _YEARLY_MINOR["USD"])
     try:
         return int(os.environ.get(f"PRICE_{interval.upper()}_{currency}_AMOUNT", default))
     except ValueError:
@@ -135,24 +229,19 @@ def base_amount(interval: str, currency: str) -> int:
 
 # Explicit per-currency prices attached to the base Price via Stripe
 # `currency_options`. These OVERRIDE Adaptive Pricing for the listed currencies,
-# so customers in those regions pay THIS EXACT amount (US = $19.99, never an FX
-# conversion), while Adaptive Pricing converts the base for every OTHER currency.
-# Amounts are in each currency's smallest unit; override any via env, e.g.
-# PRICE_MONTHLY_EUR_AMOUNT=1899.
-_CURRENCY_OPTION_AMOUNTS = {
-    "monthly": {"USD": 1999, "EUR": 1999, "GBP": 1699},
-    "yearly":  {"USD": 9900, "EUR": 9900, "GBP": 8400},
-}
-
-
-def price_currency_options(interval: str, base_currency: str) -> dict:
+# so customers there pay THIS EXACT amount, while Adaptive Pricing converts the
+# base for every OTHER currency. Monthly amounts follow the CURRENT price
+# (auto-reverting at PROMO_END_UTC); yearly is fixed. Env-overridable per market.
+def price_currency_options(interval: str, base_currency: str, now=None) -> dict:
     """Explicit per-currency amounts for `interval`, EXCLUDING the base currency
-    (Stripe rejects a currency_option that equals the price's own currency).
-    Returns {CUR: amount}. Env-overridable per currency."""
+    (Stripe rejects a currency_option equal to the price's own currency)."""
     base = normalize_currency(base_currency)
+    if interval == "monthly":
+        amounts = {c: _monthly_minor_units(c, now) for c in ("USD", "EUR", "GBP")}
+    else:
+        amounts = {"USD": 9900, "EUR": 9900, "GBP": 8400}
     out = {}
-    for cur, amt in _CURRENCY_OPTION_AMOUNTS.get(interval, {}).items():
-        cur = cur.upper()
+    for cur, amt in amounts.items():
         if cur == base:
             continue
         try:
@@ -169,14 +258,18 @@ def base_display() -> dict:
     return {"symbol": d["symbol"], "monthly": d["monthly"], "yearly": d["yearly"]}
 
 
-def currency_display() -> dict:
-    """Per-currency symbol + monthly/yearly display strings for the UI."""
+def currency_display(now=None) -> dict:
+    """Per-currency symbol + monthly/yearly display strings for the UI. Monthly
+    reflects the CURRENT price (auto-reverts at PROMO_END_UTC)."""
+    syms = {"USD": "$", "THB": "฿", "EUR": "€", "GBP": "£"}
+    yearly = {"USD": "$99", "THB": "฿3,499", "EUR": "€99", "GBP": "£84"}
     out = {}
-    for cur, (symbol, monthly, yearly) in _CURRENCY_DISPLAY_DEFAULTS.items():
+    for cur, sym in syms.items():
+        monthly = _fmt_price(sym, _monthly_minor_units(cur, now) / 100)
         out[cur] = {
-            "symbol": symbol,
+            "symbol": sym,
             "monthly": os.environ.get(f"PRICE_MONTHLY_{cur}_DISPLAY", monthly).strip(),
-            "yearly": os.environ.get(f"PRICE_YEARLY_{cur}_DISPLAY", yearly).strip(),
+            "yearly": os.environ.get(f"PRICE_YEARLY_{cur}_DISPLAY", yearly[cur]).strip(),
         }
     return out
 
@@ -191,7 +284,7 @@ def available_currencies() -> list:
             avail.append(cur)
     return avail
 # Revenue per active subscriber used for MRR in the admin analytics.
-MRR_PER_SUBSCRIBER = float(os.environ.get("MRR_PER_SUBSCRIBER", "19.99"))
+MRR_PER_SUBSCRIBER = float(os.environ.get("MRR_PER_SUBSCRIBER", str(monthly_price_usd())))
 APP_BASE_URL = os.environ.get("APP_BASE_URL", "http://localhost:8000").strip()
 
 # --- Transactional email (Resend) ---
@@ -355,6 +448,11 @@ def openai_ready() -> bool:
 
 def stripe_ready() -> bool:
     return bool(STRIPE_SECRET_KEY)
+
+
+def revenuecat_ready() -> bool:
+    """Server can verify purchases + trust webhooks once the secret key is set."""
+    return bool(REVENUECAT_SECRET_KEY)
 
 
 def email_ready() -> bool:

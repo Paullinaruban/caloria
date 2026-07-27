@@ -1,6 +1,7 @@
 """Stripe subscriptions (stdlib only).
 
-Creates Checkout Sessions for the Monthly ($19.99) and Yearly ($99) plans, and
+Creates Checkout Sessions for the Monthly and Yearly plans (amounts come from
+config.MONTHLY_PRICE_USD / YEARLY_PRICE_USD — the single pricing source), and
 verifies webhooks to upgrade/downgrade accounts. Prices can be supplied via env
 (STRIPE_PRICE_MONTHLY / STRIPE_PRICE_YEARLY) or auto-created on first use and
 cached in the kv table.
@@ -98,7 +99,7 @@ def _ensure_price(interval: str, currency: str = None) -> str:
     # 3) auto-create a Price in THIS currency. Cache keys are scoped to
     # currency+mode so switching currency creates a new price instead of reusing
     # an incompatible one.
-    # Explicit per-currency prices ($19.99 US, €19.99 EU, £16.99 UK, …) that
+    # Explicit per-currency prices (derived from config.MONTHLY_PRICE_USD) that
     # override Adaptive Pricing for those markets; Adaptive Pricing converts the
     # THB base for every other currency. Buyers see their local currency either way.
     opts = config.price_currency_options(interval, currency)
@@ -174,12 +175,16 @@ def create_checkout(user, interval: str, return_base: str = "") -> str:
         except Exception:  # noqa: BLE001 — a bad cache entry just means "create fresh"
             pass
 
-    # ONE base price, denominated in the account's settlement currency
-    # (config.BASE_CURRENCY — THB for a Thailand account). Because the price
-    # currency IS a settlement currency, Stripe Adaptive Pricing is eligible and
-    # presents/charges each customer in their own local currency, converting from
-    # the base. We never pin the buyer's currency on the session ourselves.
-    price_id = _ensure_price(interval, config.BASE_CURRENCY)
+    # Price resolution — ONE source, used by the Checkout Session below:
+    #  • If you set an explicit Price id (STRIPE_PRICE_MONTHLY / STRIPE_PRICE_YEARLY)
+    #    in the Dashboard, checkout uses EXACTLY that Price — you manage the amount
+    #    yourself and this overrides everything below.
+    #  • Otherwise we auto-create/reuse ONE base price denominated in the account's
+    #    settlement currency (config.BASE_CURRENCY — THB for a Thailand account),
+    #    with its amount coming from MONTHLY_PRICE_USD. Because the base currency is
+    #    a settlement currency, Stripe Adaptive Pricing presents/charges each buyer
+    #    in their own local currency, converting from the base.
+    price_id = config.explicit_price_id(interval) or _ensure_price(interval, config.BASE_CURRENCY)
     # Return to the site the request came from (so a private preview deployment
     # lands back on the preview, not the main domain). Only allow-listed origins
     # are honored — anything else falls back to APP_BASE_URL.

@@ -36,6 +36,7 @@ import learning
 import mealplan
 import pipeline
 import ratelimit
+import revenuecat
 import turnstile
 import usage
 import vision
@@ -169,6 +170,11 @@ class Handler(BaseHTTPRequestHandler):
         "/api/auth/forgot", "/api/auth/reset", "/api/auth/reset-check",
         "/api/billing/checkout", "/api/billing/portal",
         "/api/billing/webhook", "/api/billing/status",
+        # In-App Purchase (RevenueCat): the webhook is unauthenticated (verified
+        # by a shared Authorization secret); /api/iap/sync is reachable by an
+        # authenticated-but-not-yet-premium user (it's what MAKES them premium),
+        # so it must bypass the premium gate — the handler checks the user itself.
+        "/api/revenuecat/webhook", "/api/iap/sync",
         # Caloria Club (founding members) — public by design: visitors join with
         # just an email, before they have any account. Rate-limited + deduped.
         "/api/club/join", "/api/club/answers", "/api/club/status", "/api/club/stats",
@@ -251,17 +257,31 @@ class Handler(BaseHTTPRequestHandler):
                 "stripe_configured": config.stripe_ready(),
                 "images_enabled": images.available(),
                 "free_scan_limit": config.FREE_SCAN_LIMIT,
-                # Product anchor price shown on the marketing page ($19.99 / $99).
-                # At Checkout, Stripe presents each buyer their own local currency:
-                # exact currency_options amounts for US/EU/UK, Adaptive Pricing
-                # converts the base for everywhere else. THB is only the internal
-                # settlement currency and is never shown to US/EU/UK customers.
+                # Product price shown on the marketing page. At Checkout, Stripe
+                # presents each buyer their own local currency: exact
+                # currency_options amounts for US/EU/UK, Adaptive Pricing converts
+                # the base for everywhere else. THB is only the internal settlement
+                # currency and is never shown to US/EU/UK customers. All of these
+                # derive from config.MONTHLY_PRICE_USD (single source of truth).
                 "price_monthly": config.PRICE_MONTHLY_DISPLAY,
                 "price_yearly": config.PRICE_YEARLY_DISPLAY,
+                # Struck-through "was" anchor + numeric prices so the frontend can
+                # render the anchor and compute the yearly savings % dynamically.
+                "price_monthly_compare": config.PRICE_MONTHLY_COMPARE_DISPLAY,
+                "price_monthly_usd": config.MONTHLY_PRICE_USD,
+                "price_yearly_usd": config.YEARLY_PRICE_USD,
+                "price_monthly_compare_usd": config.MONTHLY_COMPARE_USD,
                 "trial_days": config.TRIAL_DAYS,
                 # Public bits the frontend needs (site key is meant to be public).
                 "turnstile_site_key": config.TURNSTILE_SITE_KEY,
                 "require_verification": config.REQUIRE_EMAIL_VERIFICATION,
+                # In-App Purchase: RevenueCat PUBLIC SDK keys (safe to expose) +
+                # whether the server can verify purchases. The native app uses the
+                # key matching its platform; the website ignores all of this.
+                "revenuecat_apple_key": config.REVENUECAT_APPLE_KEY,
+                "revenuecat_google_key": config.REVENUECAT_GOOGLE_KEY,
+                "revenuecat_entitlement": config.REVENUECAT_ENTITLEMENT,
+                "iap_enabled": config.revenuecat_ready(),
             })
         if path == "/api/me":
             u = self._require_user()
@@ -536,6 +556,10 @@ class Handler(BaseHTTPRequestHandler):
         # Webhook needs the raw body for signature verification.
         if path == "/api/billing/webhook":
             return self._webhook()
+        # RevenueCat (Apple/Google IAP) webhook — verified by a shared secret in
+        # the Authorization header rather than a body signature.
+        if path == "/api/revenuecat/webhook":
+            return self._rc_webhook()
         # RFC 8058 one-click unsubscribe: mail clients POST (form-encoded, not
         # JSON) to the same signed URL from the List-Unsubscribe header.
         if path == "/api/club/unsubscribe":
@@ -580,6 +604,7 @@ class Handler(BaseHTTPRequestHandler):
             "/api/billing/checkout": self._checkout,
             "/api/billing/confirm": self._billing_confirm,
             "/api/billing/portal": self._billing_portal,
+            "/api/iap/sync": self._iap_sync,
             "/api/club/join": self._club_join,
             "/api/club/answers": self._club_answers,
             "/api/club/admin/send-update": self._club_send_update,
@@ -1267,6 +1292,39 @@ class Handler(BaseHTTPRequestHandler):
         except billing.BillingError as e:
             return self._send(400, {"error": str(e)})
         self._send(200, {"received": True})
+
+    def _rc_webhook(self):
+        """RevenueCat webhook — the durable source of truth for IAP entitlements
+        (renewals, expirations, refunds, cross-device). Verified by the shared
+        Authorization secret configured in the RevenueCat dashboard."""
+        raw = self._raw_body()
+        try:
+            if not revenuecat.verify_webhook_auth(self.headers.get("Authorization", "")):
+                return self._send(401, {"error": "bad webhook auth"})
+        except revenuecat.RevenueCatError as e:
+            return self._send(503, {"error": str(e)})
+        try:
+            payload = json.loads(raw.decode() or "{}")
+        except (json.JSONDecodeError, ValueError):
+            return self._send(400, {"error": "invalid JSON body"})
+        try:
+            revenuecat.handle_event(payload)
+        except Exception as e:  # noqa: BLE001 — never 500 a webhook; RC would retry-storm
+            print(f"[caloria][rc] webhook handling error: {e}")
+        self._send(200, {"received": True})
+
+    def _iap_sync(self, data):
+        """Post-purchase: verify the signed-in user's entitlements directly with
+        RevenueCat and unlock immediately (webhook-independent), then return the
+        refreshed user — mirrors the Stripe confirm flow."""
+        u = self._require_user()
+        if not u:
+            return
+        try:
+            revenuecat.sync_subscriber(u)
+        except Exception as e:  # noqa: BLE001 — never 500 the return flow
+            print(f"[caloria][rc] iap sync error: {e}")
+        self._send(200, {"user": auth.public_user(self._user())})   # refreshed post-activation
 
 
 def main():

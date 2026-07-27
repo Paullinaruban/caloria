@@ -50,7 +50,7 @@ services:
       - key: ADMIN_EMAILS
         value: "polinaryzova8@gmail.com"
       - key: FOUNDING_MEMBER_DEADLINE
-        value: "2026-07-15"
+        value: "2026-07-12"
       # ---- set these in the Render dashboard (Environment tab), NOT in git ----
       #   RESEND_API_KEY          -> re_...            (emails)
       #   STRIPE_SECRET_KEY       -> sk_test_...       (TEST mode — no real charges)
