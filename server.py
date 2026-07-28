@@ -16,6 +16,7 @@ from urllib.parse import urlparse, parse_qs
 
 import account
 import admin
+import appauth
 import aicost
 import auth
 import insights
@@ -184,6 +185,10 @@ class Handler(BaseHTTPRequestHandler):
         # only computes (same nutrition_engine math) and never saves. The answers
         # are attached to the account afterward via the authenticated /api/onboarding.
         "/api/onboarding/preview",
+        # NATIVE iOS onboarding (verify-first). App-gated inside the handlers by the
+        # X-Caloria-App secret; no Turnstile. The website flow is untouched.
+        "/api/app/verify/start", "/api/app/verify/check", "/api/app/register",
+        "/api/app/iap/grant",
     })
 
     # Signed-in pre-paywall funnel: reachable by an AUTHENTICATED user who has not
@@ -588,6 +593,10 @@ class Handler(BaseHTTPRequestHandler):
             "/api/auth/reset-check": self._reset_check_code,
             "/api/onboarding": self._onboarding,
             "/api/onboarding/preview": self._onboarding_preview,
+            "/api/app/verify/start": self._app_verify_start,
+            "/api/app/verify/check": self._app_verify_check,
+            "/api/app/register": self._app_register,
+            "/api/app/iap/grant": self._app_iap_grant,
             "/api/analyze": self._analyze,
             "/api/correct": self._correct,
             "/api/meals": self._save_meal,
@@ -804,6 +813,48 @@ class Handler(BaseHTTPRequestHandler):
             print(f"[caloria] onboarding preview failed: {e}")
             return self._send(400, {"error": "We couldn't build your plan. Please try again."})
         self._send(200, {"targets": targets})
+
+    # ---- NATIVE iOS onboarding (verify-first) ----
+    def _app_gate(self) -> bool:
+        if not appauth.app_secret_ok(self.headers.get("X-Caloria-App", "")):
+            self._send(403, {"error": "app client not authorized"})
+            return False
+        return True
+
+    def _app_verify_start(self, data):
+        if not self._app_gate():
+            return
+        if self._rate_limited("app_verify", self._client_ip()):
+            return
+        try:
+            self._send(200, appauth.start_verification(data.get("email"), data.get("name", "")))
+        except appauth.AppAuthError as e:
+            self._send(e.code, {"error": e.message})
+
+    def _app_verify_check(self, data):
+        if not self._app_gate():
+            return
+        try:
+            self._send(200, appauth.check_code(data.get("email"), data.get("code")))
+        except appauth.AppAuthError as e:
+            self._send(e.code, {"error": e.message})
+
+    def _app_register(self, data):
+        if not self._app_gate():
+            return
+        try:
+            self._send(200, appauth.register(
+                data.get("email"), data.get("password"), data.get("name", ""), data.get("profile")))
+        except appauth.AppAuthError as e:
+            self._send(e.code, {"error": e.message})
+
+    def _app_iap_grant(self, data):
+        if not self._app_gate():
+            return
+        u = self._require_user()
+        if not u:
+            return
+        self._send(200, appauth.grant_premium(u))
 
     # ---- scanning (gated) ----
     def _analyze(self, data):

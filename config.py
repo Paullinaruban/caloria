@@ -450,6 +450,12 @@ def stripe_ready() -> bool:
     return bool(STRIPE_SECRET_KEY)
 
 
+# Native iOS app client gate: when set, the /api/app/* endpoints require this
+# value in the X-Caloria-App header (keeps random web callers out; the app ships
+# it). Leave blank in dev to keep them open.
+APP_CLIENT_SECRET = os.environ.get("APP_CLIENT_SECRET", "").strip()
+
+
 def revenuecat_ready() -> bool:
     """Server can verify purchases + trust webhooks once the secret key is set."""
     return bool(REVENUECAT_SECRET_KEY)
