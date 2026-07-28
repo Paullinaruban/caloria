@@ -179,6 +179,11 @@ class Handler(BaseHTTPRequestHandler):
         # just an email, before they have any account. Rate-limited + deduped.
         "/api/club/join", "/api/club/answers", "/api/club/status", "/api/club/stats",
         "/api/club/unsubscribe",
+        # Onboarding reorder: the questionnaire now runs BEFORE account creation, so
+        # the results screen computes targets with NO account/login. This endpoint
+        # only computes (same nutrition_engine math) and never saves. The answers
+        # are attached to the account afterward via the authenticated /api/onboarding.
+        "/api/onboarding/preview",
     })
 
     # Signed-in pre-paywall funnel: reachable by an AUTHENTICATED user who has not
@@ -582,6 +587,7 @@ class Handler(BaseHTTPRequestHandler):
             "/api/auth/reset": self._reset_password,
             "/api/auth/reset-check": self._reset_check_code,
             "/api/onboarding": self._onboarding,
+            "/api/onboarding/preview": self._onboarding_preview,
             "/api/analyze": self._analyze,
             "/api/correct": self._correct,
             "/api/meals": self._save_meal,
@@ -785,6 +791,19 @@ class Handler(BaseHTTPRequestHandler):
             return
         profile = data.get("profile") or data
         self._send(200, auth.save_profile(u["id"], profile))
+
+    def _onboarding_preview(self, data):
+        """PUBLIC — compute targets from the questionnaire answers WITHOUT an
+        account or saving anything, so the results screen can be shown before
+        sign-up (new onboarding order). Uses the exact same nutrition_engine math
+        as /api/onboarding; the answers are saved later, once the account exists."""
+        profile = data.get("profile") or data
+        try:
+            targets = auth.compute_targets(profile)
+        except Exception as e:  # noqa: BLE001 — never 500 the funnel
+            print(f"[caloria] onboarding preview failed: {e}")
+            return self._send(400, {"error": "We couldn't build your plan. Please try again."})
+        self._send(200, {"targets": targets})
 
     # ---- scanning (gated) ----
     def _analyze(self, data):
