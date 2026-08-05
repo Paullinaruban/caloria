@@ -49,51 +49,41 @@ USDA_DATA_TYPES = ["Foundation", "SR Legacy"]  # reliable per-100g profiles
 STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY", "").strip()
 STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "").strip()
 # Explicit Stripe Price ids (price_...). When set, checkout uses EXACTLY that Price
-# and OVERRIDES auto-creation. For the time-limited promo you can set TWO monthly
-# ids and the code auto-switches at PROMO_END_UTC; or leave them blank and the
-# Price auto-creates from the amount below (which ALSO auto-reverts). See
-# explicit_price_id() and billing.create_checkout().
-STRIPE_PRICE_MONTHLY         = os.environ.get("STRIPE_PRICE_MONTHLY", "").strip()          # legacy single monthly id
-STRIPE_PRICE_MONTHLY_PROMO   = os.environ.get("STRIPE_PRICE_MONTHLY_PROMO", "").strip()    # $15 promo price id (optional)
-STRIPE_PRICE_MONTHLY_REGULAR = os.environ.get("STRIPE_PRICE_MONTHLY_REGULAR", "").strip()  # $19.99 regular price id (optional)
-STRIPE_PRICE_YEARLY          = os.environ.get("STRIPE_PRICE_YEARLY", "").strip()           # yearly id
+# and OVERRIDES auto-creation. Set STRIPE_PRICE_MONTHLY to your $19/month Price id
+# and STRIPE_PRICE_YEARLY to your $99/year Price id. Leave blank to auto-create the
+# Price from the amounts below. See explicit_price_id() and billing.create_checkout().
+STRIPE_PRICE_MONTHLY = os.environ.get("STRIPE_PRICE_MONTHLY", "").strip()   # the $19/month Price id
+STRIPE_PRICE_YEARLY  = os.environ.get("STRIPE_PRICE_YEARLY", "").strip()    # the $99/year Price id
 
 # ============================================================================
-# SUBSCRIPTION PRICING — SINGLE SOURCE OF TRUTH (time-limited promo)
+# SUBSCRIPTION PRICING — SINGLE SOURCE OF TRUTH
 # ----------------------------------------------------------------------------
-# Monthly is the PROMO price ($15) until PROMO_END_UTC, then AUTOMATICALLY returns
-# to the REGULAR price ($19.99) with NO redeploy. Every surface — display strings,
-# the Stripe amount in every currency, /api/config, the landing hero/paywalls, and
-# admin MRR — reads the helpers below, so the switch happens everywhere at once.
-# Everything is env-overridable. Yearly is fixed.
+# Monthly is a flat $19/month, always presented as a discount: $25 struck through
+# with $19 emphasized. Every surface — display strings, the Stripe amount in every
+# currency, /api/config, the landing hero/paywalls, and admin MRR — reads the
+# helpers below, so one change updates everything at once. All env-overridable.
+# The actual Stripe charge uses STRIPE_PRICE_MONTHLY (your $19 Price id); if unset,
+# a $19 Price is auto-created from MONTHLY_PRICE_USD. Yearly is fixed at $99.
 # ============================================================================
 import datetime as _dt
 
-MONTHLY_PROMO_USD   = float(os.environ.get("MONTHLY_PROMO_USD", "15"))       # apology / launch offer
-MONTHLY_REGULAR_USD = float(os.environ.get("MONTHLY_REGULAR_USD", "19.99"))  # normal price after the promo
-YEARLY_PRICE_USD    = float(os.environ.get("YEARLY_PRICE_USD", "99"))
-# Promo runs THROUGH this UTC instant; the moment it passes, monthly auto-reverts.
-PROMO_END_UTC = os.environ.get("PROMO_END_UTC", "2026-08-05T23:59:59Z").strip()
+MONTHLY_PRICE_USD_BASE = float(os.environ.get("MONTHLY_PRICE_USD", "19"))     # actual charged price
+MONTHLY_COMPARE_USD    = float(os.environ.get("MONTHLY_COMPARE_USD", "25"))   # struck-through "was" price
+YEARLY_PRICE_USD       = float(os.environ.get("YEARLY_PRICE_USD", "99"))
 
 
 def promo_active(now=None) -> bool:
-    """True while the $15 promo is running; False once PROMO_END_UTC has passed."""
-    if not PROMO_END_UTC:
-        return False
-    try:
-        end = _dt.datetime.strptime(PROMO_END_UTC, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=_dt.timezone.utc)
-    except ValueError:
-        return True  # misconfigured deadline → fail safe to the cheaper promo price
-    return (now or _dt.datetime.now(_dt.timezone.utc)) <= end
+    """The discount ($25 → $19) is always presented to users."""
+    return True
 
 
 def monthly_price_usd(now=None) -> float:
-    """Current monthly price in USD — promo until the deadline, then regular."""
-    return MONTHLY_PROMO_USD if promo_active(now) else MONTHLY_REGULAR_USD
+    """Current monthly price in USD (flat $19)."""
+    return MONTHLY_PRICE_USD_BASE
 
 
 def _fmt_price(symbol, amt) -> str:
-    """'$15' for whole amounts, '$19.99' when cents are present."""
+    """'$19' for whole amounts, '$19.50' when cents are present."""
     return f"{symbol}{int(amt)}" if float(amt).is_integer() else f"{symbol}{amt:.2f}"
 
 
@@ -103,7 +93,7 @@ _YEARLY_MINOR = {"USD": 9900, "THB": 349900, "EUR": 9900, "GBP": 8400}
 
 
 def _monthly_minor_units(currency: str, now=None) -> int:
-    """Current monthly amount in the currency's smallest unit (auto-reverts)."""
+    """Current monthly amount in the currency's smallest unit."""
     amt = monthly_price_usd(now) * _MONTHLY_FX_PER_USD.get(currency, 1.0)
     minor = amt * 100
     if currency == "THB":                 # keep THB to whole baht
@@ -112,12 +102,12 @@ def _monthly_minor_units(currency: str, now=None) -> int:
 
 
 def price_monthly_display(now=None) -> str:
-    return _fmt_price("$", monthly_price_usd(now))
+    return _fmt_price("$", monthly_price_usd(now))               # "$19"
 
 
 def price_monthly_compare_display(now=None):
-    """Struck-through 'was' price shown WHILE the promo is on ($19.99); None after."""
-    return _fmt_price("$", MONTHLY_REGULAR_USD) if promo_active(now) else None
+    """Struck-through 'was' price shown next to the monthly price ($25)."""
+    return _fmt_price("$", MONTHLY_COMPARE_USD)                  # "$25"
 
 
 PRICE_YEARLY_DISPLAY = _fmt_price("$", YEARLY_PRICE_USD)   # "$99" (static)
@@ -132,8 +122,6 @@ def __getattr__(name):
         return price_monthly_display()
     if name == "PRICE_MONTHLY_COMPARE_DISPLAY":
         return price_monthly_compare_display()
-    if name == "MONTHLY_COMPARE_USD":
-        return MONTHLY_REGULAR_USD
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 # --- RevenueCat (Apple In-App Purchase now; Google Play later) ---
@@ -184,16 +172,12 @@ def stripe_price_id(interval: str, currency: str) -> str:
 
 def explicit_price_id(interval: str, now=None) -> str:
     """Explicit Stripe Price id to use for checkout (overrides auto-creation).
-    Monthly auto-switches promo→regular at PROMO_END_UTC. Returns '' → the Price
-    auto-creates from the current amount (which also auto-reverts). To pin explicit
-    Dashboard-managed prices WITH auto-revert, set STRIPE_PRICE_MONTHLY_PROMO and
-    STRIPE_PRICE_MONTHLY_REGULAR."""
+    Set STRIPE_PRICE_MONTHLY to your $19/month Price id and STRIPE_PRICE_YEARLY to
+    the $99/year id. Returns '' → the Price auto-creates from the amount in config."""
     if interval == "yearly":
         return STRIPE_PRICE_YEARLY
     if interval == "monthly":
-        if promo_active(now):
-            return STRIPE_PRICE_MONTHLY_PROMO or STRIPE_PRICE_MONTHLY
-        return STRIPE_PRICE_MONTHLY_REGULAR   # empty after promo → auto-create $19.99
+        return STRIPE_PRICE_MONTHLY
     return ""
 
 
@@ -213,7 +197,7 @@ if BASE_CURRENCY not in SUPPORTED_CURRENCIES:
 
 # Amount (in the currency's smallest unit) used ONLY when auto-creating a base
 # price and no explicit Stripe Price id is set. Monthly derives from the CURRENT
-# monthly price (auto-reverts at PROMO_END_UTC); yearly is fixed. Override per
+# monthly price; yearly is fixed. Override per
 # market via env, e.g. PRICE_MONTHLY_THB_AMOUNT=52500 (satang → ฿525.00).
 def base_amount(interval: str, currency: str, now=None) -> int:
     currency = normalize_currency(currency)
@@ -231,7 +215,7 @@ def base_amount(interval: str, currency: str, now=None) -> int:
 # `currency_options`. These OVERRIDE Adaptive Pricing for the listed currencies,
 # so customers there pay THIS EXACT amount, while Adaptive Pricing converts the
 # base for every OTHER currency. Monthly amounts follow the CURRENT price
-# (auto-reverting at PROMO_END_UTC); yearly is fixed. Env-overridable per market.
+#; yearly is fixed. Env-overridable per market.
 def price_currency_options(interval: str, base_currency: str, now=None) -> dict:
     """Explicit per-currency amounts for `interval`, EXCLUDING the base currency
     (Stripe rejects a currency_option equal to the price's own currency)."""
@@ -260,7 +244,7 @@ def base_display() -> dict:
 
 def currency_display(now=None) -> dict:
     """Per-currency symbol + monthly/yearly display strings for the UI. Monthly
-    reflects the CURRENT price (auto-reverts at PROMO_END_UTC)."""
+    reflects the CURRENT price."""
     syms = {"USD": "$", "THB": "฿", "EUR": "€", "GBP": "£"}
     yearly = {"USD": "$99", "THB": "฿3,499", "EUR": "€99", "GBP": "£84"}
     out = {}
