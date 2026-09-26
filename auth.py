@@ -329,15 +329,52 @@ def is_verified(row) -> bool:
     return bool(row["email_verified"])
 
 
+# Stripe subscription statuses that mean the customer is entitled: paying,
+# trialing, in the automatic-retry grace window, or an admin-granted comp.
+_ENTITLED_STRIPE_STATUS = {"active", "trialing", "past_due", "manual"}
+
+
+def _row_get(row, key, default=None):
+    """Safe access for an sqlite3.Row (missing column -> default)."""
+    try:
+        v = row[key]
+        return default if v is None else v
+    except (KeyError, IndexError):
+        return default
+
+
+def _has_live_entitlement(row) -> bool:
+    """True if the account holds a live paid entitlement from EITHER billing
+    source, independent of the cached `plan` flag.
+
+    This is the resilience guarantee: a paying subscriber is NEVER shown the
+    paywall just because the `plan` column was flipped to 'free' by a transient
+    or cross-source (Stripe <-> Apple/Google) webhook race.
+    """
+    # Active Stripe subscription (web).
+    has_stripe = bool(_row_get(row, "stripe_subscription") or _row_get(row, "stripe_customer"))
+    status = str(_row_get(row, "subscription_status", "") or "").lower()
+    if has_stripe and status in _ENTITLED_STRIPE_STATUS:
+        return True
+    # Active Apple / Google in-app purchase.
+    if _row_get(row, "iap_active"):
+        return True
+    return False
+
+
 def is_premium(row) -> bool:
-    """Effective premium status — includes the developer/admin testing overrides."""
+    """Effective premium status. The cached `plan` flag is the fast path; a live
+    Stripe/IAP entitlement is honored even if that flag was incorrectly flipped,
+    so an existing paying customer can never be locked out of what they paid for."""
     import config
     if config.DEV_UNLIMITED:
         return True
     email = (row["email"] or "").lower()
     if email in config.ADMIN_EMAILS:
         return True
-    return row["plan"] == "premium"
+    if row["plan"] == "premium":
+        return True
+    return _has_live_entitlement(row)
 
 
 def grant_founding_if_invited(user_id: int, email: str) -> bool:
