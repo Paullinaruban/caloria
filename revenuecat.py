@@ -133,15 +133,21 @@ def set_entitlement(user_id, *, active, provider="app_store", product=None,
                   f"provider={provider} product={product} expires={expires_iso}")
             return True
 
-        # Lapse: turn off the IAP flag. Only drop to 'free' if the account is not
-        # an active Stripe (web) subscriber — never break a web customer.
+        # Lapse: turn off the IAP flag.
         c.execute("UPDATE users SET iap_active=0, iap_expires_at=COALESCE(?, iap_expires_at) "
                   "WHERE id=?", (expires_iso, user_id))
-        if stripe_active:
-            print(f"[caloria][rc] IAP lapsed user={user_id} but Stripe active — keeping premium")
-            return True
+        # NEVER let an Apple/Google lapse downgrade a Stripe-linked account. The
+        # Stripe webhook is the SOLE authority over a Stripe customer's plan — so
+        # we only drop to 'free' for accounts with no Stripe linkage at all. (The
+        # previous guard required subscription_status to be in a fixed active set,
+        # which downgraded paying web customers whenever that status was stale.)
+        has_stripe_link = bool(row["stripe_customer"] or row["stripe_subscription"])
+        if has_stripe_link:
+            print(f"[caloria][rc] IAP lapsed user={user_id} but account is Stripe-linked — "
+                  f"leaving plan to Stripe (status={row['subscription_status']!r})")
+            return stripe_active
         c.execute("UPDATE users SET plan='free' WHERE id=? AND plan='premium'", (user_id,))
-        print(f"[caloria][rc] REVOKE premium user={user_id} (no active Stripe)")
+        print(f"[caloria][rc] REVOKE premium user={user_id} (no Stripe linkage)")
         return False
 
 
