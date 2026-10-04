@@ -734,7 +734,11 @@ class Handler(BaseHTTPRequestHandler):
                 "error": "That code is incorrect or has expired. Please check the code or request a new one.",
                 "expired": True,
             })
-        self._send(200, {"ok": True})
+        # `ok` is an auth payload {token, user}: log the user straight in so they
+        # never have to re-type the new password (avoids password-manager autofill
+        # submitting the OLD saved password). Still backward compatible: `ok` is
+        # truthy and also carries `token`.
+        self._send(200, ok)
 
     def _reset_check_code(self, data):
         """Non-burning check so the UI can advance to the new-password step."""
