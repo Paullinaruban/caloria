@@ -95,7 +95,10 @@ def start_verification(email, name=""):
         )
     sent = True
     try:
-        email_send.send_verification_code(email, code, trace="app-signup")
+        # Stable Resend idempotency key (action:email:code, hashed) so the send's
+        # internal retries collapse to one delivery; a new code yields a new key.
+        idem = "cal-" + hashlib.sha256(f"appverify:{email}:{code}".encode()).hexdigest()[:40]
+        email_send.send_verification_code(email, code, trace="app-signup", idempotency_key=idem)
     except Exception as e:  # noqa: BLE001 — never break the flow on a mail hiccup
         sent = False
         print(f"[caloria][appauth] verification email failed for {email}: {e}")

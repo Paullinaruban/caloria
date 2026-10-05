@@ -861,6 +861,11 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self._rate_limited("app_verify", self._client_ip()):
             return
+        # Per-recipient cooldown + hourly cap (shared "verify" budget with the web
+        # resend/forgot/change-email paths) so the native app can't bypass the
+        # email-abuse protection. Clear 429 + Retry-After when throttled.
+        if self._email_throttled("verify", str(data.get("email", ""))):
+            return
         try:
             self._send(200, appauth.start_verification(data.get("email"), data.get("name", "")))
         except appauth.AppAuthError as e:
