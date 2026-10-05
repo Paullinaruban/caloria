@@ -15,6 +15,7 @@ import secrets
 import config
 import db
 import email_send
+import ratelimit
 import tokens
 
 # OWASP (2024) recommends >= 600,000 iterations for PBKDF2-HMAC-SHA256. Hashes are
@@ -118,6 +119,14 @@ def signup(email: str, password: str, name: str = "") -> dict:
 
 
 # ---------- email verification (6-digit code) ----------
+def _email_idem(action: str, user_id: int, code: str) -> str:
+    """Stable Resend idempotency key for one logical code email. Derived from the
+    action + account + the specific code (hashed, so the raw code never appears in
+    the key/logs). Identical across the send's internal retries → Resend collapses
+    them to a single delivery; a genuinely new code yields a new key."""
+    return "cal-" + hashlib.sha256(f"{action}:{user_id}:{code}".encode()).hexdigest()[:40]
+
+
 def send_verification(user_id: int, email: str, context: str = "verify") -> bool:
     """Issue a fresh 6-digit code and email it — SYNCHRONOUSLY, within the current
     request. Returns True only if the provider actually accepted the message.
@@ -126,6 +135,16 @@ def send_verification(user_id: int, email: str, context: str = "verify") -> bool
     import time
     t0 = time.time()
     print(f"[verify-trace] {context}: send_verification ENTER user={user_id} email={email}", flush=True)
+    # Anti-spam: the login path auto-sends a code on every unverified login, which
+    # would let repeated logins flood one inbox. Throttle it per recipient (shared
+    # "verify" budget with resend/change-email). We check BEFORE issuing a code so
+    # a throttled attempt doesn't invalidate the code the user already received.
+    # signup/resend/change-email are gated at their own entry points instead.
+    if context == "login":
+        allowed, retry = ratelimit.email_gate("verify", email)
+        if not allowed:
+            print(f"[verify-trace] {context}: THROTTLED (retry_after={retry}s) — not sending", flush=True)
+            return False
     try:
         code = tokens.issue_code(user_id, "verify", config.VERIFY_CODE_TTL_MINUTES)
     except Exception as e:  # noqa: BLE001 — code issues must not break auth
@@ -137,7 +156,8 @@ def send_verification(user_id: int, email: str, context: str = "verify") -> bool
         return False
     try:
         email_send.send_verification_code(
-            email, code, timeout=config.EMAIL_TIMEOUT_INTERACTIVE, trace=context)
+            email, code, timeout=config.EMAIL_TIMEOUT_INTERACTIVE, trace=context,
+            idempotency_key=_email_idem("verify", user_id, code))
         print(f"[verify-trace] {context}: RESULT sent=True in {int((time.time()-t0)*1000)}ms", flush=True)
         return True
     except Exception as e:  # noqa: BLE001 — a failed send must not break signup/login
@@ -201,7 +221,7 @@ def request_reset(email: str) -> None:
         return
     try:
         code = tokens.issue_code(row["id"], "reset", config.RESET_CODE_TTL_MINUTES)
-        email_send.send_reset_code(email, code)
+        email_send.send_reset_code(email, code, idempotency_key=_email_idem("reset", row["id"], code))
     except Exception as e:  # noqa: BLE001
         print(f"[caloria] reset email failed for {email}: {e}")
 
