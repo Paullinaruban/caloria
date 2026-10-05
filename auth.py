@@ -225,7 +225,15 @@ def reset_password_with_code(email: str, code: str, new_password: str) -> bool:
         )
         # Reset invalidates all existing sessions (force re-login everywhere).
         c.execute("DELETE FROM sessions WHERE user_id = ?", (row["id"],))
-    return True
+    print(f"[caloria] password reset OK for user={row['id']} email={email}")  # observability
+    # Auto-login: the emailed one-time code already proved control of this
+    # account, so we issue a fresh session immediately. This removes the
+    # error-prone "now re-type your new password on the login screen" step,
+    # where a password manager / iCloud Keychain often autofills the OLD saved
+    # password and causes a false "Incorrect email or password". Returns the
+    # same {token, user} shape as login().
+    fresh = _get_user(row["id"])
+    return {"token": _new_session(row["id"]), "user": _public_user(fresh)}
 
 
 def check_reset_code(email: str, code: str) -> bool:
