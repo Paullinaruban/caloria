@@ -67,3 +67,48 @@ def _gc(now: float) -> None:
     dead = [k for k, q in _hits.items() if not q or q[-1] < now - longest]
     for k in dead:
         _hits.pop(k, None)
+
+
+# --------------------------------------------------------------------------- #
+# per-recipient email gate — cooldown + hourly cap (anti-spam for Resend)
+# --------------------------------------------------------------------------- #
+# The per-IP LIMITS above don't stop the same RECIPIENT from being emailed over
+# and over (a bot rotating IPs, or shared-NAT traffic). This gate throttles by
+# the target email address instead: at most one send per `cooldown` seconds and
+# `hourly_max` sends per hour. It is keyed on the SUBMITTED email string, checked
+# before any account lookup, so it behaves identically whether or not the account
+# exists — it leaks no account-enumeration signal.
+#
+# action -> (cooldown_seconds, hourly_max)
+EMAIL_GATES = {
+    "verify": (60, 5),   # verification-code emails (signup resend / login / change-email)
+    "reset":  (60, 5),   # password-reset-code emails
+}
+_EMAIL_GATE_WINDOW = 3600  # the hourly cap's window; also the gc horizon below
+
+
+def email_gate(action: str, email: str) -> tuple[bool, int]:
+    """Throttle code emails per recipient. Returns (allowed, retry_after_seconds)
+    and records the send when allowed. Unknown actions are never limited."""
+    cfg = EMAIL_GATES.get(action)
+    if not cfg:
+        return True, 0
+    cooldown, hourly_max = cfg
+    key = f"emailgate:{action}:{(email or '').strip().lower()}"
+    now = time.time()
+    with _lock:
+        q = _hits.get(key)
+        if q is None:
+            q = []
+            _hits[key] = q
+        cutoff = now - _EMAIL_GATE_WINDOW
+        while q and q[0] < cutoff:
+            q.pop(0)
+        if len(q) >= hourly_max:                       # hourly cap hit
+            return False, max(int(q[0] + _EMAIL_GATE_WINDOW - now) + 1, 1)
+        if q and (now - q[-1]) < cooldown:             # still within cooldown
+            return False, max(int(cooldown - (now - q[-1])) + 1, 1)
+        q.append(now)
+        if len(_hits) > 5000:
+            _gc(now)
+        return True, 0

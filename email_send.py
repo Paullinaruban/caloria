@@ -30,7 +30,7 @@ class EmailError(RuntimeError):
 
 def _send(to: str, subject: str, html: str, text: str,
           headers: dict | None = None, timeout: int | None = None,
-          trace: str | None = None) -> str | None:
+          trace: str | None = None, idempotency_key: str | None = None) -> str | None:
     """Send one email via Resend. Returns the Resend message id on success (and
     logs it for a delivery audit trail), or None in the dev/console fallback.
     `headers` adds custom SMTP headers (e.g. List-Unsubscribe for bulk sends).
@@ -53,16 +53,22 @@ def _send(to: str, subject: str, html: str, text: str,
         payload["reply_to"] = [config.EMAIL_REPLY_TO]
     if headers:
         payload["headers"] = headers
+    req_headers = {
+        "Authorization": f"Bearer {config.RESEND_API_KEY}",
+        "Content-Type": "application/json",
+        # Resend is behind Cloudflare, which 403s the default Python-urllib
+        # User-Agent (error 1010). A normal UA is required for delivery.
+        "User-Agent": "Caloria/1.0 (+https://caloria.app)",
+    }
+    if idempotency_key:
+        # Resend honours Idempotency-Key for ~24h: the SAME key collapses the
+        # 3 internal retries (and any accidental duplicate request for the same
+        # code) into a single delivered email, instead of sending several.
+        req_headers["Idempotency-Key"] = idempotency_key
     req = urllib.request.Request(
         _RESEND_URL,
         data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "Authorization": f"Bearer {config.RESEND_API_KEY}",
-            "Content-Type": "application/json",
-            # Resend is behind Cloudflare, which 403s the default Python-urllib
-            # User-Agent (error 1010). A normal UA is required for delivery.
-            "User-Agent": "Caloria/1.0 (+https://caloria.app)",
-        },
+        headers=req_headers,
         method="POST",
     )
     body = None
@@ -145,7 +151,8 @@ def send_verification(to: str, link: str) -> None:
 
 
 def send_verification_code(to: str, code: str, timeout: int | None = None,
-                           trace: str | None = None) -> None:
+                           trace: str | None = None,
+                           idempotency_key: str | None = None) -> None:
     code_html = (
         '<div style="font-family:-apple-system,Segoe UI,sans-serif;font-size:34px;'
         'font-weight:700;letter-spacing:10px;color:#2a2230;background:#fff;'
@@ -163,7 +170,8 @@ def send_verification_code(to: str, code: str, timeout: int | None = None,
         f"Welcome to Caloria! Your email verification code is: {code}\n"
         f"It expires in {config.VERIFY_CODE_TTL_MINUTES} minutes. Don't share it with anyone."
     )
-    _send(to, "Your Caloria verification code", html, text, timeout=timeout, trace=trace)
+    _send(to, "Your Caloria verification code", html, text, timeout=timeout,
+          trace=trace, idempotency_key=idempotency_key)
 
 
 def _open(label="Open Caloria"):
@@ -228,7 +236,7 @@ def send_reset(to: str, link: str) -> None:
     _send(to, "Reset your Caloria password", html, text)
 
 
-def send_reset_code(to: str, code: str) -> None:
+def send_reset_code(to: str, code: str, idempotency_key: str | None = None) -> None:
     code_html = (
         '<div style="font-family:-apple-system,Segoe UI,sans-serif;font-size:34px;'
         'font-weight:700;letter-spacing:10px;color:#2a2230;background:#fff;'
@@ -248,4 +256,5 @@ def send_reset_code(to: str, code: str) -> None:
         f"It expires in {config.RESET_CODE_TTL_MINUTES} minutes. "
         "If you didn't request it, ignore this email — your password is unchanged."
     )
-    _send(to, "Your Caloria password reset code", html, text)
+    _send(to, "Your Caloria password reset code", html, text,
+          idempotency_key=idempotency_key)

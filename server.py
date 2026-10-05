@@ -106,6 +106,25 @@ class Handler(BaseHTTPRequestHandler):
             return True
         return False
 
+    def _email_throttled(self, action: str, email: str) -> bool:
+        """Per-recipient email gate (cooldown + hourly cap). Returns True (and sends
+        a clear 429 with Retry-After) when the submitted address has been emailed
+        too recently/often. Keyed on the submitted email only, so it reveals nothing
+        about whether an account exists."""
+        ok, retry = ratelimit.email_gate(action, email)
+        if ok:
+            return False
+        self.send_response(429)
+        self.send_header("Retry-After", str(retry))
+        self.send_header("Content-Type", "application/json")
+        self._cors()
+        self.end_headers()
+        self.wfile.write(json.dumps({
+            "error": f"Please wait {retry} seconds before requesting another code.",
+            "retry_after": retry,
+        }).encode())
+        return True
+
     def _raw_body(self):
         length = int(self.headers.get("Content-Length", 0))
         if length <= 0 or length > MAX_BODY:
@@ -692,6 +711,9 @@ class Handler(BaseHTTPRequestHandler):
         # Prefer the signed-in user; fall back to a supplied email. Always neutral.
         u = self._user()
         email = u["email"] if u else str(data.get("email", ""))
+        # Per-recipient cooldown + hourly cap (shared "verify" budget).
+        if self._email_throttled("verify", email):
+            return
         auth.resend_verification(email)
         self._send(200, {"ok": True})
 
@@ -704,6 +726,10 @@ class Handler(BaseHTTPRequestHandler):
         u = self._require_user()
         if not u:
             return
+        # Per-recipient cooldown + hourly cap (shared "verify" budget) so the new
+        # address can't be used to fire off a burst of verification emails.
+        if self._email_throttled("verify", str(data.get("email", ""))):
+            return
         try:
             new_email = auth.change_email(u["id"], data.get("email", ""))
         except auth.AuthError as e:
@@ -714,7 +740,12 @@ class Handler(BaseHTTPRequestHandler):
     def _forgot_password(self, data):
         if self._rate_limited("forgot", self._client_ip()):
             return
-        auth.request_reset(str(data.get("email", "")))
+        email = str(data.get("email", ""))
+        # Per-recipient cooldown + hourly cap. Keyed on the submitted address only
+        # (frequency-based), so a 429 here still reveals nothing about existence.
+        if self._email_throttled("reset", email):
+            return
+        auth.request_reset(email)
         # Always 200 — never reveal whether the email exists (no enumeration).
         self._send(200, {"ok": True})
 
