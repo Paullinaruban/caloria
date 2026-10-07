@@ -315,6 +315,17 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/me":
             u = self._require_user()
             if u:
+                # Self-heal: an account that looks non-premium but holds a Stripe
+                # subscription may just have a stale/missed-webhook status. Confirm
+                # against Stripe (source of truth) so a paying customer is never
+                # locked out of what they bought. Only ever grants (never revokes),
+                # and skips the Stripe call for free / definitively-canceled rows.
+                if not auth.is_premium(u):
+                    try:
+                        if billing.reconcile_entitlement(u):
+                            u = auth._get_user(u["id"])  # refresh after repair
+                    except Exception as e:  # /api/me must never 500
+                        print(f"[caloria] entitlement reconcile error: {e}")
                 self._send(200, {"user": auth.public_user(u)})
             return
         if path == "/api/meals":
@@ -408,6 +419,18 @@ class Handler(BaseHTTPRequestHandler):
             email = (qs.get("email") or [""])[0]
             try:
                 return self._send(200, admin.user_detail(email))
+            except ValueError as e:
+                return self._send(404, {"error": str(e)})
+        if path == "/api/admin/entitlement-trace":
+            # Support tool: show the EXACT premium-access decision chain + live
+            # Stripe status for one account; ?fix=1 also self-heals a stale row.
+            if not self._require_admin():
+                return
+            qs = parse_qs(urlparse(self.path).query)
+            email = (qs.get("email") or [""])[0]
+            fix = (qs.get("fix") or ["0"])[0] in ("1", "true", "yes")
+            try:
+                return self._send(200, admin.entitlement_trace(email, fix=fix))
             except ValueError as e:
                 return self._send(404, {"error": str(e)})
         if path == "/api/admin/community":

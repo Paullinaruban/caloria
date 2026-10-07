@@ -136,6 +136,117 @@ def user_detail(email: str) -> dict:
     }
 
 
+def entitlement_trace(email: str, fix: bool = False) -> dict:
+    """Print the EXACT premium-access decision chain for one account, with the
+    real database values and a LIVE Stripe lookup — so support can see precisely
+    which field/condition is causing a paid customer to be gated, instead of
+    guessing. With fix=True it also runs the Stripe reconcile (self-heal) and
+    reports before/after. Admin-gated, read-only unless fix=True."""
+    import auth
+    import billing
+
+    email = (email or "").strip().lower()
+    with db.cursor() as c:
+        r = c.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
+        if not r:
+            raise ValueError("No user with that email.")
+        # Duplicate / sibling accounts that could hold the real subscription.
+        dupes = c.execute(
+            "SELECT id, email, plan, subscription_status, stripe_customer, stripe_subscription "
+            "FROM users WHERE id <> ? AND (stripe_customer = ? OR LOWER(name) = LOWER(?)) ",
+            (r["id"], r["stripe_customer"], r["name"] or ""),
+        ).fetchall()
+
+    status = str(r["subscription_status"] or "").lower()
+    has_stripe = bool(r["stripe_subscription"] or r["stripe_customer"])
+    status_entitled = status in auth._ENTITLED_STRIPE_STATUS
+    iap = bool(r["iap_active"])
+    admin_email = (r["email"] or "").lower() in config.ADMIN_EMAILS
+
+    # The actual decision chain, step by step, with the value at each gate.
+    chain = {
+        "dev_unlimited": bool(config.DEV_UNLIMITED),
+        "admin_email": admin_email,
+        "plan_is_premium": r["plan"] == "premium",
+        "has_stripe_link": has_stripe,
+        "subscription_status": status or "—",
+        "status_in_entitled_set": status_entitled,
+        "entitled_set": sorted(auth._ENTITLED_STRIPE_STATUS),
+        "iap_active": iap,
+        "_has_live_entitlement": (has_stripe and status_entitled) or iap,
+        "is_premium": auth.is_premium(r),
+    }
+
+    # The real Stripe truth for this exact subscription (not the cached column).
+    stripe_live = {"checked": False}
+    try:
+        info = billing.subscription_info(r)  # does a live Stripe GET when configured
+        active_live = billing.live_subscription_active(r)
+        stripe_live = {
+            "checked": True,
+            "live_status": info.get("status"),
+            "current_period_end": info.get("current_period_end"),
+            "cancel_at_period_end": info.get("cancel_at_period_end"),
+            "stripe_says_active": active_live,  # True/False/None(undeterminable)
+        }
+    except Exception as e:  # noqa: BLE001
+        stripe_live = {"checked": False, "error": str(e)}
+
+    result = {
+        "user": {
+            "id": r["id"], "email": r["email"], "name": r["name"] or "",
+            "plan": r["plan"], "subscription_status": r["subscription_status"] or "—",
+            "stripe_customer": r["stripe_customer"] or None,
+            "stripe_subscription": r["stripe_subscription"] or None,
+            "iap_active": iap, "email_verified": bool(r["email_verified"]),
+            "active": bool(r["active"]), "created_at": r["created_at"],
+        },
+        "decision_chain": chain,
+        "stripe_live": stripe_live,
+        "duplicate_accounts": [dict(d) for d in dupes],
+        "verdict": _entitlement_verdict(chain, stripe_live, dupes),
+    }
+
+    if fix:
+        before = auth.is_premium(r)
+        healed = False
+        try:
+            healed = billing.reconcile_entitlement(r)
+        except Exception as e:  # noqa: BLE001
+            result["fix_error"] = str(e)
+        # Re-read after any repair.
+        with db.cursor() as c:
+            r2 = c.execute("SELECT * FROM users WHERE id = ?", (r["id"],)).fetchone()
+        result["fix"] = {
+            "attempted": True,
+            "reconciled": healed,
+            "is_premium_before": before,
+            "is_premium_after": auth.is_premium(r2),
+            "plan_after": r2["plan"],
+            "subscription_status_after": r2["subscription_status"],
+        }
+    return result
+
+
+def _entitlement_verdict(chain, stripe_live, dupes) -> str:
+    if chain["is_premium"]:
+        return "ENTITLED — this account already resolves to premium; the gate should not fire."
+    if chain["plan_is_premium"]:
+        return "ENTITLED via plan flag."
+    sa = stripe_live.get("stripe_says_active")
+    if sa is True:
+        return ("STALE CACHE — Stripe says the subscription is ACTIVE but the cached "
+                "plan/status are not entitled. Run with fix=1 (or let /api/me reconcile) to self-heal.")
+    if sa is False:
+        return ("GENUINE LAPSE — Stripe reports this subscription is NOT active. This account "
+                "is correctly gated; it is a billing matter, not a code bug.")
+    if dupes:
+        return ("POSSIBLE WRONG ACCOUNT — no live Stripe subscription on THIS row, but "
+                "sibling account(s) share the Stripe customer or name; the subscription may live there.")
+    return ("NO STRIPE SUBSCRIPTION on this row and Stripe status undeterminable — likely the "
+            "paying account is a different record, or billing never attached a subscription here.")
+
+
 def set_active(email: str, active: bool) -> dict:
     email = (email or "").strip().lower()
     with db.cursor() as c:
