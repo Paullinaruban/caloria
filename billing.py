@@ -349,6 +349,61 @@ def _set_by_customer(customer, *, plan, status, subscription=None):
             )
 
 
+# Terminal states: the subscription is definitively over, so there's no point
+# re-asking Stripe (and we must not hammer the API on every request for these).
+_TERMINAL_STATUSES = {"canceled", "unpaid", "incomplete_expired"}
+
+
+def _row(user, key, default=None):
+    try:
+        v = user[key]
+        return default if v is None else v
+    except (KeyError, IndexError):
+        return default
+
+
+def live_subscription_active(user):
+    """Ask Stripe (the source of truth) whether this user's subscription is
+    currently active/trialing/past_due. Returns True/False, or None when it
+    can't be determined (Stripe not configured, no subscription id, or API
+    error) so callers fall back to the cached state."""
+    sub_id = _row(user, "stripe_subscription")
+    if not (config.stripe_ready() and sub_id):
+        return None
+    try:
+        s = _stripe(f"subscriptions/{sub_id}", method="GET")
+    except BillingError as e:
+        print(f"[caloria] live subscription check failed: {e}")
+        return None
+    return (s.get("status") or "").lower() in _ACTIVE_STATUSES
+
+
+def reconcile_entitlement(user) -> bool:
+    """Self-heal a stale 'free'/non-entitled row for a customer whose Stripe
+    subscription is in fact still active (e.g. a missed or out-of-order webhook).
+    Confirms with Stripe and, only if Stripe says active, repairs the cached
+    plan/status and returns True.
+
+    This can ONLY grant access that Stripe confirms — it never downgrades anyone
+    and never masks a real cancellation, so it is safe for all other customers.
+    Definitively-terminal statuses are trusted as-is (no Stripe call)."""
+    status = str(_row(user, "subscription_status", "") or "").lower()
+    if status in _TERMINAL_STATUSES:
+        return False
+    if live_subscription_active(user) is not True:
+        return False
+    customer = _row(user, "stripe_customer")
+    if customer:
+        _set_by_customer(customer, plan="premium", status="active",
+                         subscription=_row(user, "stripe_subscription"))
+    else:
+        with db.cursor() as c:
+            c.execute("UPDATE users SET plan='premium', subscription_status='active' WHERE id=?",
+                      (user["id"],))
+    print(f"[caloria] reconciled entitlement from Stripe for user={user['id']}")
+    return True
+
+
 def _log_event(etype, customer, status, user_id=None):
     """Append to the billing event log (subscription history & support)."""
     try:
