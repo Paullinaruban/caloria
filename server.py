@@ -1316,6 +1316,15 @@ class Handler(BaseHTTPRequestHandler):
             elif action == "delete":
                 account.delete_by_email(email)
                 return self._send(200, {"ok": True, "deleted": True})
+            elif action == "relink_subscription":
+                # Move an active Stripe link between two of the customer's own
+                # accounts (paid-on-one, logs-into-another). from/to are user ids.
+                try:
+                    from_id = int(data.get("from"))
+                    to_id = int(data.get("to"))
+                except (TypeError, ValueError):
+                    return self._send(400, {"error": "from and to (account ids) are required"})
+                return self._send(200, {"ok": True, "relink": admin.relink_subscription(from_id, to_id)})
             else:
                 return self._send(400, {"error": "unknown action"})
         except ValueError as e:
