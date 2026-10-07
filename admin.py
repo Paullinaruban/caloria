@@ -247,6 +247,86 @@ def _entitlement_verdict(chain, stripe_live, dupes) -> str:
             "paying account is a different record, or billing never attached a subscription here.")
 
 
+def relink_subscription(from_id: int, to_id: int) -> dict:
+    """Move an ACTIVE Stripe customer/subscription link from one Caloria account
+    to another — e.g. a customer who paid on one account but signs in to another.
+
+    Safe + admin-only, and deliberately conservative:
+      - both accounts must exist;
+      - the SOURCE must have a Stripe customer + subscription;
+      - Stripe must confirm that subscription is actually ACTIVE (no moving a
+        dead link);
+      - refuses to clobber a DIFFERENT existing subscription on the target;
+      - moves the SAME customer/subscription (no new sub, no charge, nothing in
+        Stripe is mutated), grants the target premium, demotes the source to
+        free, and writes an audit row.
+    Returns before/after is_premium for both accounts."""
+    import auth
+    import billing
+
+    if int(from_id) == int(to_id):
+        raise ValueError("Source and target are the same account.")
+    src = auth._get_user(int(from_id))
+    dst = auth._get_user(int(to_id))
+    if not src:
+        raise ValueError(f"Source account {from_id} not found.")
+    if not dst:
+        raise ValueError(f"Target account {to_id} not found.")
+    customer = src["stripe_customer"]
+    sub = src["stripe_subscription"]
+    if not (customer and sub):
+        raise ValueError(f"Source account {from_id} has no Stripe customer/subscription to move.")
+    if billing.live_subscription_active(src) is not True:
+        raise ValueError("Refusing to move: Stripe does not report this subscription as active.")
+    if dst["stripe_subscription"] and dst["stripe_subscription"] != sub:
+        raise ValueError(
+            f"Target account {to_id} already has a different subscription "
+            f"({dst['stripe_subscription']}); aborting to avoid clobbering it.")
+
+    before = {"from_is_premium": auth.is_premium(src), "to_is_premium": auth.is_premium(dst)}
+    now = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    with db.cursor() as c:
+        # Grant premium on the account she actually uses — SAME customer + sub.
+        c.execute(
+            "UPDATE users SET stripe_customer=?, stripe_subscription=?, plan='premium', "
+            "subscription_status='active', plan_interval=COALESCE(?, plan_interval), "
+            "subscribed_at=COALESCE(subscribed_at, ?) WHERE id=?",
+            (customer, sub, src["plan_interval"], src["subscribed_at"] or now, int(to_id)),
+        )
+        # Detach the link from the old account and set it back to free.
+        c.execute(
+            "UPDATE users SET stripe_customer=NULL, stripe_subscription=NULL, plan='free', "
+            "subscription_status='moved' WHERE id=?",
+            (int(from_id),),
+        )
+    try:
+        with db.cursor() as c:
+            c.execute(
+                "INSERT INTO billing_events (user_id, customer, type, status) VALUES (?,?,?,?)",
+                (int(to_id), customer, f"admin_relink_from_{int(from_id)}", "active"),
+            )
+    except Exception as e:  # noqa: BLE001 — audit log must not block the repair
+        print(f"[caloria][admin] relink audit log failed: {e}")
+    print(f"[caloria][admin] relinked subscription {sub} (customer {customer}) "
+          f"from user {from_id} -> {to_id}")
+
+    src2 = auth._get_user(int(from_id))
+    dst2 = auth._get_user(int(to_id))
+    return {
+        "moved": {"customer": customer, "subscription": sub,
+                  "from": int(from_id), "to": int(to_id)},
+        "before": before,
+        "after": {
+            "from_is_premium": auth.is_premium(src2),
+            "to_is_premium": auth.is_premium(dst2),
+            "from_plan": src2["plan"], "from_subscription_status": src2["subscription_status"],
+            "to_plan": dst2["plan"], "to_subscription_status": dst2["subscription_status"],
+            "to_stripe_customer": dst2["stripe_customer"],
+            "to_stripe_subscription": dst2["stripe_subscription"],
+        },
+    }
+
+
 def set_active(email: str, active: bool) -> dict:
     email = (email or "").strip().lower()
     with db.cursor() as c:
