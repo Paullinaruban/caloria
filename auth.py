@@ -246,13 +246,21 @@ def reset_password_with_code(email: str, code: str, new_password: str) -> bool:
         # Reset invalidates all existing sessions (force re-login everywhere).
         c.execute("DELETE FROM sessions WHERE user_id = ?", (row["id"],))
     print(f"[caloria] password reset OK for user={row['id']} email={email}")  # observability
+    fresh = _get_user(row["id"])
+    # A deactivated/banned account may reset its password, but must NOT be handed
+    # a session — otherwise password reset would bypass the deactivation gate that
+    # login() enforces (login raises 403 when the account is inactive). In that
+    # case behave like the pre-auto-login flow: return True (success, no token) so
+    # the frontend sends them to the login screen, which then correctly 403s.
+    if not _is_active(fresh):
+        print(f"[caloria] password reset for DEACTIVATED user={row['id']} — no session issued")
+        return True
     # Auto-login: the emailed one-time code already proved control of this
     # account, so we issue a fresh session immediately. This removes the
     # error-prone "now re-type your new password on the login screen" step,
     # where a password manager / iCloud Keychain often autofills the OLD saved
     # password and causes a false "Incorrect email or password". Returns the
     # same {token, user} shape as login().
-    fresh = _get_user(row["id"])
     return {"token": _new_session(row["id"]), "user": _public_user(fresh)}
 
 
