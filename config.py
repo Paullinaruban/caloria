@@ -430,6 +430,21 @@ def openai_ready() -> bool:
     return bool(OPENAI_API_KEY) and not _is_placeholder(OPENAI_API_KEY)
 
 
+# --- Caloria Starter (entry plan, new users only) ---------------------------
+# A $11.99 one-month, NON-RENEWING entry plan with the basic app but NO AI
+# (Meal Scan / AI Coach). Requires an explicit Stripe Price id for the $11.99
+# recurring-monthly product; Starter is offered only when this is configured.
+STARTER_PRICE_USD     = float(os.environ.get("STARTER_PRICE_USD", "11.99"))
+STARTER_PRICE_DISPLAY = f"${STARTER_PRICE_USD:.2f}"
+STRIPE_PRICE_STARTER  = os.environ.get("STRIPE_PRICE_STARTER", "").strip()
+
+
+def starter_ready() -> bool:
+    """Starter can be offered only when Stripe is configured AND a Starter Price
+    id is set (we never auto-create the Starter price)."""
+    return bool(STRIPE_SECRET_KEY and STRIPE_PRICE_STARTER)
+
+
 def stripe_ready() -> bool:
     return bool(STRIPE_SECRET_KEY)
 
@@ -451,3 +466,46 @@ def email_ready() -> bool:
 
 def turnstile_ready() -> bool:
     return bool(TURNSTILE_SECRET and TURNSTILE_SITE_KEY)
+
+
+# --- AI Coach photo attachments (cost-aware) --------------------------------
+# Images route through the existing vision-capable model (OPENAI_VISION_MODEL,
+# default gpt-4o-mini) with "low" detail. We downscale + re-encode server-side
+# so the longest side is <= COACH_IMAGE_MAX_DIM and quality is bounded, keeping
+# image tokens (and cost) low. The client also compresses before upload.
+COACH_IMAGE_MAX_DIM   = int(os.environ.get("COACH_IMAGE_MAX_DIM", "768"))
+COACH_IMAGE_QUALITY   = int(os.environ.get("COACH_IMAGE_QUALITY", "72"))
+# Hard cap on the RAW decoded bytes we accept before optimizing (server-side
+# guard; the client sends ~100–250 KB after its own resize).
+COACH_IMAGE_MAX_BYTES = int(os.environ.get("COACH_IMAGE_MAX_BYTES", str(6 * 1024 * 1024)))
+
+
+# --- Winter Arc (seasonal layer) -------------------------------------------
+# A single source of truth for the seasonal experience. Everything is a plain
+# env-overridable flag so the whole layer can be switched on/off without code
+# changes, and disabling it never touches stored user progress.
+WINTER_ARC_ENABLED     = os.environ.get("WINTER_ARC_ENABLED", "true").lower() == "true"
+WINTER_ARC_SHOW_CARD   = os.environ.get("WINTER_ARC_SHOW_CARD", "true").lower() == "true"
+WINTER_ARC_SNOW        = os.environ.get("WINTER_ARC_SNOW", "true").lower() == "true"
+WINTER_ARC_ANIMATIONS  = os.environ.get("WINTER_ARC_ANIMATIONS", "true").lower() == "true"
+# First calendar day is available immediately on START; a new day unlocks each
+# calendar day thereafter. This is the campaign *content* version, not a date.
+WINTER_ARC_VERSION     = os.environ.get("WINTER_ARC_VERSION", "2026-winter-1").strip()
+WINTER_ARC_DAYS        = 30
+# Email launch campaign id (ledger key) + test recipients (comma-separated).
+WINTER_ARC_CAMPAIGN_ID = os.environ.get("WINTER_ARC_CAMPAIGN_ID", "winter_arc_2026_launch").strip()
+WINTER_ARC_TEST_EMAILS = {
+    e.strip().lower() for e in os.environ.get("WINTER_ARC_TEST_EMAILS", "").split(",") if e.strip()
+}
+
+
+def winter_arc_public() -> dict:
+    """Seasonal flags safe to expose to the frontend via /api/config."""
+    return {
+        "enabled": WINTER_ARC_ENABLED,
+        "show_card": WINTER_ARC_ENABLED and WINTER_ARC_SHOW_CARD,
+        "snow": WINTER_ARC_ENABLED and WINTER_ARC_SNOW,
+        "animations": WINTER_ARC_ENABLED and WINTER_ARC_ANIMATIONS,
+        "days": WINTER_ARC_DAYS,
+        "version": WINTER_ARC_VERSION,
+    }

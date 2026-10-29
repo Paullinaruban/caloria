@@ -174,6 +174,33 @@ def send_verification_code(to: str, code: str, timeout: int | None = None,
           trace=trace, idempotency_key=idempotency_key)
 
 
+def send_starter_expired(to: str, name: str = "") -> None:
+    """Sent after a Starter one-month subscription has ended (no auto-renewal).
+    Offers an optional upgrade to Premium ($19.99/mo) with AI Meal Scan + AI Coach."""
+    upgrade_url = config.APP_BASE_URL.rstrip("/") + "/?upgrade=premium"
+    html = _shell(
+        "Your first month at Caloria Club has ended 💗",
+        "<p>Hi!</p>"
+        "<p>Your first month at Caloria Club has officially come to an end.</p>"
+        "<p>We hope you've enjoyed building your wellness routine with us!</p>"
+        "<p><b>Ready to take your experience further?</b></p>"
+        "<p>Upgrade to <b>Caloria Premium for $19.99/month</b> and unlock your full "
+        "personalized wellness experience, including:</p>"
+        "<p>✨ <b>AI Meal Scan</b> — scan your meals and get calorie and macro estimates.<br>"
+        "✨ <b>AI Coach</b> — get personalized guidance and chat with your AI wellness coach.</p>"
+        "<p>Your next level starts here.</p>"
+        + _button(upgrade_url, "Upgrade to Caloria Premium")
+        + "<p style='color:#8a7886'>With love,<br>The Caloria Club Team 💗</p>",
+    )
+    text = (
+        "Hi!\n\nYour first month at Caloria Club has officially come to an end. "
+        "We hope you've enjoyed building your wellness routine with us!\n\n"
+        "Upgrade to Caloria Premium for $19.99/month and unlock AI Meal Scan and AI Coach:\n"
+        f"{upgrade_url}\n\nWith love,\nThe Caloria Club Team"
+    )
+    _send(to, "Your first month at Caloria Club has ended 💗", html, text)
+
+
 def _open(label="Open Caloria"):
     return _button(config.APP_BASE_URL, label)
 

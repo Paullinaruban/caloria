@@ -399,18 +399,58 @@ def _has_live_entitlement(row) -> bool:
 
 
 def is_premium(row) -> bool:
-    """Effective premium status. The cached `plan` flag is the fast path; a live
-    Stripe/IAP entitlement is honored even if that flag was incorrectly flipped,
-    so an existing paying customer can never be locked out of what they paid for."""
+    """Active PAID APP ACCESS (Starter OR Premium). Kept under this historical
+    name because it is what gates the app paywall and the basic features. It is
+    True for both paid tiers — AI features use has_ai() instead. The cached
+    `plan` flag is the fast path; a live Stripe/IAP entitlement is still honored
+    so a paying customer is never locked out of what they bought."""
     import config
     if config.DEV_UNLIMITED:
         return True
     email = (row["email"] or "").lower()
     if email in config.ADMIN_EMAILS:
         return True
-    if row["plan"] == "premium":
+    if (row["plan"] or "") in ("premium", "starter"):
         return True
     return _has_live_entitlement(row)
+
+
+def tier(row) -> str:
+    """The account's effective plan tier: 'premium' | 'starter' | 'free'."""
+    import config
+    if config.DEV_UNLIMITED:
+        return "premium"
+    if (row["email"] or "").lower() in config.ADMIN_EMAILS:
+        return "premium"
+    plan = (_row_get(row, "plan", "") or "").lower()
+    if plan == "premium":
+        return "premium"
+    if plan == "starter":
+        return "starter"
+    # A live Stripe/IAP entitlement with no explicit tier marker is legacy
+    # Premium (existing paying customers are never Starter).
+    if _has_live_entitlement(row):
+        return "premium"
+    return "free"
+
+
+def has_ai(row) -> bool:
+    """Access to the AI features (Meal Scan + AI Coach). PREMIUM only — Starter
+    deliberately excludes AI. (tier() already resolves dev/admin to premium.)"""
+    return tier(row) == "premium"
+
+
+def starter_eligible(row) -> bool:
+    """Starter is a ONE-TIME entry offer for brand-new, never-paid users only.
+    Existing subscribers and anyone who has ever paid are not eligible (so no one
+    is downgraded or re-offered it)."""
+    import config
+    if not config.starter_ready():
+        return False
+    return (tier(row) == "free"
+            and not _row_get(row, "starter_used")
+            and not _row_get(row, "subscribed_at")
+            and not _row_get(row, "stripe_subscription"))
 
 
 def grant_founding_if_invited(user_id: int, email: str) -> bool:
@@ -449,13 +489,19 @@ def is_founding(row) -> bool:
 
 def _public_user(row) -> dict:
     import config
-    premium = is_premium(row)
+    t = tier(row)
     return {
         "id": row["id"],
         "email": row["email"],
         "name": row["name"] or "",
-        # Report the EFFECTIVE plan so the UI unlocks everything in dev/admin mode.
-        "plan": "premium" if premium else row["plan"],
+        # `plan` stays "premium" for BOTH paid tiers so Starter keeps access to
+        # the basic (non-AI) features the UI already gates on plan==="premium".
+        # `tier` carries the real tier for status display, and `has_ai` is the
+        # Premium-only gate for AI Meal Scan + AI Coach.
+        "plan": "premium" if t in ("premium", "starter") else "free",
+        "tier": t,
+        "has_ai": has_ai(row),
+        "starter_eligible": starter_eligible(row),
         "is_admin": (row["email"] or "").lower() in config.ADMIN_EMAILS,
         "dev_unlimited": config.DEV_UNLIMITED,
         "founding_member": is_founding(row),

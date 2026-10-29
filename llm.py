@@ -65,16 +65,21 @@ def chat_json(system: str, user: str, *, temperature: float = 0.6, max_tokens: i
 
 
 def chat_text(system: str, messages: list, *, temperature: float = 0.7, max_tokens: int = 450,
-              user_id=None, kind: str = "coach") -> str:
+              user_id=None, kind: str = "coach", model: str = None) -> str:
     """Multi-turn chat returning the assistant's plain-text reply.
 
-    `messages` is a list of {role: "user"|"assistant", content: str}.
+    `messages` is a list of {role, content}. `content` is normally a string, but
+    may be an OpenAI multimodal list (text + image_url parts) for a vision
+    message. `model` overrides the default text model (used to route an
+    image-containing message through the vision-capable model); cost is recorded
+    against whichever model actually ran.
     """
     if not config.openai_ready():
         raise LLMError("OPENAI_API_KEY is not set. Add it to backend/.env.")
+    model = model or config.OPENAI_TEXT_MODEL
 
     payload = {
-        "model": config.OPENAI_TEXT_MODEL,
+        "model": model,
         "temperature": temperature,
         "max_tokens": max_tokens,
         "messages": [{"role": "system", "content": system}] + messages,
@@ -93,20 +98,20 @@ def chat_text(system: str, messages: list, *, temperature: float = 0.7, max_toke
         with urllib.request.urlopen(req, timeout=config.OPENAI_TIMEOUT) as resp:
             body = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
-        aicost.record_error(kind, config.OPENAI_TEXT_MODEL, (time.perf_counter()-_t0)*1000, user_id, "error", f"HTTP {e.code}")
+        aicost.record_error(kind, model, (time.perf_counter()-_t0)*1000, user_id, "error", f"HTTP {e.code}")
         raise LLMError(f"OpenAI error {e.code}: {e.read().decode('utf-8','ignore')[:200]}") from e
     except (ssl.SSLError, socket.timeout) as e:
-        aicost.record_error(kind, config.OPENAI_TEXT_MODEL, (time.perf_counter()-_t0)*1000, user_id, "timeout", str(e))
+        aicost.record_error(kind, model, (time.perf_counter()-_t0)*1000, user_id, "timeout", str(e))
         raise LLMError(f"Network error reaching OpenAI: {e}") from e
     except urllib.error.URLError as e:
         st = "timeout" if isinstance(getattr(e, "reason", None), socket.timeout) else "error"
-        aicost.record_error(kind, config.OPENAI_TEXT_MODEL, (time.perf_counter()-_t0)*1000, user_id, st, str(e.reason))
+        aicost.record_error(kind, model, (time.perf_counter()-_t0)*1000, user_id, st, str(e.reason))
         raise LLMError(f"Could not reach OpenAI: {e.reason}") from e
     except OSError as e:
-        aicost.record_error(kind, config.OPENAI_TEXT_MODEL, (time.perf_counter()-_t0)*1000, user_id, "error", str(e))
+        aicost.record_error(kind, model, (time.perf_counter()-_t0)*1000, user_id, "error", str(e))
         raise LLMError(f"Network error reaching OpenAI: {e}") from e
 
-    aicost.record(body.get("usage"), body.get("model") or config.OPENAI_TEXT_MODEL,
+    aicost.record(body.get("usage"), body.get("model") or model,
                   (time.perf_counter() - _t0) * 1000, user_id=user_id, kind=kind)
     try:
         return body["choices"][0]["message"]["content"].strip()

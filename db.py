@@ -271,6 +271,66 @@ def init_db() -> None:
             )"""
         )
 
+        # --- Winter Arc (seasonal 30-day journey) ---
+        # One row per user holds their whole progress. completed_days /
+        # earned_rewards are JSON arrays; the server is the single source of
+        # truth (never trusts the client for availability or rewards).
+        c.execute(
+            """CREATE TABLE IF NOT EXISTS winter_arc (
+                user_id        INTEGER PRIMARY KEY,
+                started_at     TEXT NOT NULL,
+                completed_days TEXT NOT NULL DEFAULT '[]',   -- JSON array of day numbers
+                earned_rewards TEXT NOT NULL DEFAULT '[]',   -- JSON array of reward ids
+                status         TEXT NOT NULL DEFAULT 'in_progress',  -- in_progress | completed
+                version        TEXT,
+                updated_at     TEXT DEFAULT CURRENT_TIMESTAMP
+            )"""
+        )
+        # Product-announcement unsubscribe (separate from transactional email):
+        # one-click opt-out that the Winter Arc launch campaign honours.
+        _add_column(c, "users", "broadcast_unsubscribed", "INTEGER NOT NULL DEFAULT 0")
+        # Launch-campaign status (one row per campaign id) with a resume
+        # watermark so an interrupted send continues without re-emailing anyone.
+        c.execute(
+            """CREATE TABLE IF NOT EXISTS winter_arc_campaign (
+                campaign     TEXT PRIMARY KEY,
+                total        INTEGER NOT NULL DEFAULT 0,
+                sent         INTEGER NOT NULL DEFAULT 0,
+                failed       INTEGER NOT NULL DEFAULT 0,
+                skipped      INTEGER NOT NULL DEFAULT 0,
+                status       TEXT NOT NULL DEFAULT 'pending',  -- pending|sending|done|interrupted
+                test_mode    INTEGER NOT NULL DEFAULT 0,
+                last_user_id INTEGER NOT NULL DEFAULT 0,
+                started_at   TEXT,
+                finished_at  TEXT
+            )"""
+        )
+        # Per-recipient ledger — PK makes the launch send idempotent across
+        # retries and repeated launch presses (never emails the same user twice).
+        c.execute(
+            """CREATE TABLE IF NOT EXISTS winter_arc_sends (
+                user_id    INTEGER NOT NULL,
+                campaign   TEXT NOT NULL,
+                status     TEXT NOT NULL DEFAULT 'sent',   -- sent | failed
+                sent_at    TEXT DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (user_id, campaign)
+            )"""
+        )
+
+        # --- Caloria Starter (entry plan) ---
+        # One-time eligibility: a user may take the Starter entry offer only once,
+        # and only before they've ever subscribed. Set when a Starter checkout
+        # completes; checked when deciding whether to offer Starter.
+        _add_column(c, "users", "starter_used", "INTEGER NOT NULL DEFAULT 0")
+        # Dedupe ledger for the "your first month ended" expiration email (so a
+        # duplicate subscription.deleted webhook never emails twice).
+        c.execute(
+            """CREATE TABLE IF NOT EXISTS starter_expiry_sends (
+                user_id    INTEGER PRIMARY KEY,
+                sent_at    TEXT DEFAULT CURRENT_TIMESTAMP
+            )"""
+        )
+
 
 def kv_get(key: str):
     with cursor() as c:

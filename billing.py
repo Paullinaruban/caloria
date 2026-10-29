@@ -19,6 +19,7 @@ import urllib.request
 
 import config
 import db
+import email_send
 
 _API = "https://api.stripe.com/v1"
 
@@ -155,7 +156,7 @@ def clear_pending_checkout(user_id) -> None:
 
 
 def create_checkout(user, interval: str, return_base: str = "") -> str:
-    if interval not in ("monthly", "yearly"):
+    if interval not in ("monthly", "yearly", "starter"):
         raise BillingError("Invalid plan interval.")
 
     # ---- de-duplicate: reuse a recent, still-open session for this user+interval
@@ -184,7 +185,14 @@ def create_checkout(user, interval: str, return_base: str = "") -> str:
     #    with its amount coming from MONTHLY_PRICE_USD. Because the base currency is
     #    a settlement currency, Stripe Adaptive Pricing presents/charges each buyer
     #    in their own local currency, converting from the base.
-    price_id = config.explicit_price_id(interval) or _ensure_price(interval, config.BASE_CURRENCY)
+    if interval == "starter":
+        # Starter uses an EXPLICIT Stripe Price only (never auto-created). It is
+        # a monthly recurring price that we schedule to cancel after one cycle.
+        price_id = config.STRIPE_PRICE_STARTER
+        if not price_id:
+            raise BillingError("Starter plan is not configured.")
+    else:
+        price_id = config.explicit_price_id(interval) or _ensure_price(interval, config.BASE_CURRENCY)
     # Return to the site the request came from (so a private preview deployment
     # lands back on the preview, not the main domain). Only allow-listed origins
     # are honored — anything else falls back to APP_BASE_URL.
@@ -208,9 +216,13 @@ def create_checkout(user, interval: str, return_base: str = "") -> str:
         # the admin dashboard can report monthly vs yearly without extra lookups.
         "metadata[plan_interval]": interval,
         "subscription_data[metadata][plan_interval]": interval,
+        # Tier tag read back by the webhook so Starter is never auto-upgraded to
+        # Premium on a later subscription.updated event.
+        "subscription_data[metadata][tier]": ("starter" if interval == "starter" else "premium"),
     }
     # Free trial — no charge until the trial ends; cancel anytime before then.
-    if config.TRIAL_DAYS > 0:
+    # Starter is a paid one-month entry, so it never gets a trial.
+    if config.TRIAL_DAYS > 0 and interval != "starter":
         params["subscription_data[trial_period_days]"] = config.TRIAL_DAYS
 
     # Deterministic idempotency key bucketed to the reuse window: two requests that
@@ -421,6 +433,44 @@ def _log_event(etype, customer, status, user_id=None):
         print(f"[caloria] billing event log failed: {e}")
 
 
+def _is_starter_customer(customer) -> bool:
+    if not customer:
+        return False
+    with db.cursor() as c:
+        r = c.execute("SELECT plan FROM users WHERE stripe_customer=?", (customer,)).fetchone()
+    return bool(r and (r["plan"] or "") == "starter")
+
+
+def _send_starter_expiry_by_customer(customer) -> None:
+    if not customer:
+        return
+    with db.cursor() as c:
+        r = c.execute("SELECT id FROM users WHERE stripe_customer=?", (customer,)).fetchone()
+    if r:
+        _send_starter_expiry(r["id"])
+
+
+def _send_starter_expiry(user_id: int) -> None:
+    """Send the 'your first month has ended' email, with a Premium upgrade link.
+    Claims the dedupe row FIRST so a duplicate subscription.deleted webhook can
+    never send twice; email_send retries transient failures internally."""
+    with db.cursor() as c:
+        claimed = c.execute(
+            "INSERT OR IGNORE INTO starter_expiry_sends (user_id) VALUES (?)", (user_id,)
+        ).rowcount > 0
+    if not claimed:
+        return                                   # already sent — dedupe
+    with db.cursor() as c:
+        r = c.execute("SELECT email, name FROM users WHERE id=?", (user_id,)).fetchone()
+    if not r or not r["email"]:
+        return
+    try:
+        email_send.send_starter_expired(r["email"], r["name"])
+        print(f"[caloria] starter expiry email sent user={user_id}")
+    except Exception as e:  # noqa: BLE001 — logged; dedupe row stays claimed
+        print(f"[caloria] starter expiry email failed user={user_id}: {e}")
+
+
 def handle_event(event: dict) -> None:
     etype = event.get("type")
     obj = event.get("data", {}).get("object", {})
@@ -431,29 +481,52 @@ def handle_event(event: dict) -> None:
         user_id = obj.get("client_reference_id")
         if user_id:
             interval = (obj.get("metadata") or {}).get("plan_interval")
+            is_starter = interval == "starter"
+            new_plan = "starter" if is_starter else "premium"
             now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
             with db.cursor() as c:
                 c.execute(
-                    "UPDATE users SET plan='premium', subscription_status='active', "
+                    "UPDATE users SET plan=?, subscription_status='active', "
                     "stripe_customer=?, stripe_subscription=?, "
                     "plan_interval=COALESCE(?, plan_interval), "
-                    "subscribed_at=COALESCE(subscribed_at, ?) WHERE id=?",
-                    (obj.get("customer"), obj.get("subscription"), interval, now, int(user_id)),
+                    "subscribed_at=COALESCE(subscribed_at, ?)"
+                    + (", starter_used=1" if is_starter else "")
+                    + " WHERE id=?",
+                    (new_plan, obj.get("customer"), obj.get("subscription"), interval, now, int(user_id)),
                 )
             clear_pending_checkout(int(user_id))
+            if is_starter and obj.get("subscription"):
+                # Make it NON-RENEWING: bill this one month, then cancel — the
+                # customer is never charged a second time automatically.
+                try:
+                    _stripe(f"subscriptions/{obj['subscription']}",
+                            {"cancel_at_period_end": "true"}, method="POST")
+                    print(f"[caloria] starter: scheduled non-renewal for user {user_id}")
+                except BillingError as e:
+                    print(f"[caloria] starter: could not schedule non-renewal: {e}")
 
     elif etype == "customer.subscription.updated":
-        # Source of truth for status changes (trial→active, past_due, paused, etc.).
+        # Tier-aware: a Starter subscription stays Starter (never auto-upgraded).
         status = obj.get("status", "")
-        plan = "premium" if status in _ACTIVE_STATUSES else "free"
+        starter = (obj.get("metadata") or {}).get("tier") == "starter" or _is_starter_customer(obj.get("customer"))
+        if status in _ACTIVE_STATUSES:
+            plan = "starter" if starter else "premium"
+        else:
+            plan = "free"
         _set_by_customer(obj.get("customer"), plan=plan, status=status, subscription=obj.get("id"))
 
     elif etype in ("customer.subscription.deleted", "customer.subscription.canceled"):
+        starter = (obj.get("metadata") or {}).get("tier") == "starter" or _is_starter_customer(obj.get("customer"))
         _set_by_customer(obj.get("customer"), plan="free", status="canceled")
+        if starter:
+            # Starter's one month has ended — send the expiration email (deduped).
+            _send_starter_expiry_by_customer(obj.get("customer"))
 
     elif etype == "invoice.payment_failed":
         # Enter grace period; keep access while Stripe retries the card.
         _set_by_customer(obj.get("customer"), plan="premium", status="past_due")
 
     elif etype in ("invoice.paid", "invoice.payment_succeeded"):
-        _set_by_customer(obj.get("customer"), plan="premium", status="active")
+        # Preserve a Starter tier on its (single) paid invoice; else Premium.
+        plan = "starter" if _is_starter_customer(obj.get("customer")) else "premium"
+        _set_by_customer(obj.get("customer"), plan=plan, status="active")

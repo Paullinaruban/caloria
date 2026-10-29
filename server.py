@@ -41,6 +41,8 @@ import revenuecat
 import turnstile
 import usage
 import vision
+import winterarc
+import winterarc_email
 import workout
 
 MAX_BODY = 16 * 1024 * 1024
@@ -177,6 +179,18 @@ class Handler(BaseHTTPRequestHandler):
         })
         return False
 
+    def _require_ai(self, u) -> bool:
+        """AI Meal Scan + AI Coach are PREMIUM-only. Rejects Starter / free BEFORE
+        any AI provider call (so a Starter subscriber can't trigger AI cost via a
+        direct API request). Returns True only for Premium (and dev/admin)."""
+        if auth.has_ai(u):
+            return True
+        self._send(402, {
+            "error": "AI Meal Scan and AI Coach are part of Caloria Premium ($19.99/mo).",
+            "upgrade": True, "feature": "ai",
+        })
+        return False
+
     # Endpoints reachable WITHOUT an active subscription. Everything else requires
     # active Premium (enforced centrally in every dispatcher below). This list is
     # exactly: signup, login, logout, email verification, password reset, Stripe
@@ -208,6 +222,8 @@ class Handler(BaseHTTPRequestHandler):
         # X-Caloria-App secret; no Turnstile. The website flow is untouched.
         "/api/app/verify/start", "/api/app/verify/check", "/api/app/register",
         "/api/app/iap/grant",
+        # Winter Arc one-click product-announcement unsubscribe (token-based).
+        "/api/winterarc/unsubscribe",
     })
 
     # Signed-in pre-paywall funnel: reachable by an AUTHENTICATED user who has not
@@ -311,7 +327,30 @@ class Handler(BaseHTTPRequestHandler):
                 "revenuecat_google_key": config.REVENUECAT_GOOGLE_KEY,
                 "revenuecat_entitlement": config.REVENUECAT_ENTITLEMENT,
                 "iap_enabled": config.revenuecat_ready(),
+                # Seasonal layer flags (snow / card / animations / enabled).
+                "winter_arc": config.winter_arc_public(),
+                # Starter entry plan (shown to eligible new users only; eligibility
+                # itself is per-user via /api/me → starter_eligible).
+                "starter_price": config.STARTER_PRICE_DISPLAY,
+                "starter_price_usd": config.STARTER_PRICE_USD,
+                "starter_enabled": config.starter_ready(),
             })
+        if path == "/api/winterarc":
+            # Premium-gated automatically (not in _PUBLIC_PATHS). Returns the
+            # static content + THIS user's progress. Never trusts the client.
+            u = self._require_user()
+            if u:
+                self._send(200, {
+                    "flags": config.winter_arc_public(),
+                    "content": winterarc.content(),
+                    "state": winterarc.get_state(u["id"]),
+                })
+            return
+        if path == "/api/winterarc/unsubscribe":
+            # One-click opt-out of product announcements (public, token-based).
+            qs = parse_qs(urlparse(self.path).query)
+            ok = winterarc_email.unsubscribe((qs.get("t") or [""])[0])
+            return self._send_html(200, winterarc_email.unsubscribe_page(ok))
         if path == "/api/me":
             u = self._require_user()
             if u:
@@ -675,6 +714,10 @@ class Handler(BaseHTTPRequestHandler):
             "/api/admin/override": self._admin_override,
             "/api/admin/user/action": self._admin_user_action,
             "/api/admin/email-test": self._admin_email_test,
+            # Winter Arc (premium-gated by the dispatcher; admin launch gated inside).
+            "/api/winterarc/start": self._winterarc_start,
+            "/api/winterarc/complete": self._winterarc_complete,
+            "/api/admin/winterarc/launch": self._winterarc_launch,
         }
         handler = routes.get(path)
         if handler:
@@ -928,6 +971,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         if not self._require_premium(u):   # no free scans — paid subscription required
             return
+        if not self._require_ai(u):        # AI Meal Scan is Premium-only (not Starter)
+            return
         admin = self._is_admin(u)
         # Premium monthly safeguard — internal only. Neutral message, no mention of
         # limits/quotas, no upgrade prompt (they already pay).
@@ -961,6 +1006,15 @@ class Handler(BaseHTTPRequestHandler):
         # Meter only on success (failed AI calls cost nothing → don't count them).
         usage.record(u["id"], "scans", email=u["email"], plan=u["plan"], is_admin=admin)
         result["scans_used"] = u["scans_used"] + 1
+        # Winter Arc: a SUCCESSFUL meal scan auto-completes a 'scan' task (if the
+        # arc is started and such a task is currently available). Idempotent;
+        # never affects the scan on failure.
+        try:
+            w = winterarc.auto_complete(u["id"], "scan")
+            if w:
+                result["winter"] = w
+        except Exception as e:  # noqa: BLE001
+            print(f"[caloria] winter auto-complete (scan) failed: {e}")
         self._send(200, result)
 
     def _correct(self, data):
@@ -999,6 +1053,10 @@ class Handler(BaseHTTPRequestHandler):
                 (u["id"], str(meal.get("name", "Meal"))[:120], meal.get("image"), json.dumps(payload)),
             )
             meal_id = c.lastrowid
+        try:
+            winterarc.auto_complete(u["id"], "scan")   # logging a meal counts too
+        except Exception as e:  # noqa: BLE001
+            print(f"[caloria] winter auto-complete (meal) failed: {e}")
         self._send(200, {"ok": True, "id": meal_id})
 
     def _delete_meal(self):
@@ -1135,11 +1193,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         if not self._require_verified(u):
             return
-        if not auth.is_premium(u):
-            return self._send(402, {
-                "error": "AI Coach Chat is a Premium feature. Upgrade for unlimited coaching.",
-                "upgrade": True,
-            })
+        if not self._require_ai(u):   # AI Coach is Premium-only (not Starter) — blocks before any AI call
+            return
         admin = self._is_admin(u)
         # Premium monthly safeguard — internal only. Neutral message.
         if not usage.allowed(u["id"], "coach", is_admin=admin):
@@ -1147,13 +1202,28 @@ class Handler(BaseHTTPRequestHandler):
                 "error": "This feature is temporarily unavailable. Please try again shortly."
             })
         profile = json.loads(u["profile_json"]) if u["profile_json"] else None
+        image = data.get("image") or None
+        if image is not None:
+            # Server-side validation (never trust the client): safe raster type +
+            # size cap. The optimizer re-checks and strips EXIF before any send.
+            if not imagevalid.is_valid_image_data_url(image, max_len=int(config.COACH_IMAGE_MAX_BYTES * 1.4) + 4096):
+                return self._send(400, {"error": "Please attach a JPEG, PNG or WebP image under the size limit."})
         try:
-            answer = coach.reply(u["id"], data.get("message", ""), profile)
+            answer = coach.reply(u["id"], data.get("message", ""), profile, image_data_url=image)
+        except coach.ImageError as e:
+            return self._send(400, {"error": str(e)})
         except Exception as e:  # noqa: BLE001
             print(f"[caloria] coach failed for user {u['id']}: {e}")   # detail stays server-side
             return self._send(503, {"error": "The coach is unavailable right now. Please try again."})
         usage.record(u["id"], "coach", email=u["email"], plan=u["plan"], is_admin=admin)
-        self._send(200, {"reply": answer})
+        resp = {"reply": answer}
+        try:
+            w = winterarc.auto_complete(u["id"], "coach")   # a sent coach message
+            if w:
+                resp["winter"] = w
+        except Exception as e:  # noqa: BLE001
+            print(f"[caloria] winter auto-complete (coach) failed: {e}")
+        self._send(200, resp)
 
     # ---- Caloria Club (founding members) ----
     def _club_join(self, data):
@@ -1331,6 +1401,36 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(404, {"error": str(e)})
         self._send(200, {"ok": True, "user": res})
 
+    # ---- Winter Arc (seasonal) ----
+    def _winterarc_start(self, data):
+        u = self._require_user()
+        if not u:
+            return
+        self._send(200, {"ok": True, "state": winterarc.start(u["id"])})
+
+    def _winterarc_complete(self, data):
+        u = self._require_user()
+        if not u:
+            return
+        try:
+            res = winterarc.complete_day(u["id"], data.get("day"))
+        except winterarc.WinterArcError as e:
+            return self._send(e.code, {"error": e.message})
+        self._send(200, {"ok": True, **res})
+
+    def _winterarc_launch(self, data):
+        """Admin-only, intentional launch of the Winter Arc announcement email.
+        Gated: the seasonal feature must be enabled; test_mode restricts to the
+        configured test recipients; the per-recipient ledger makes it idempotent."""
+        if not self._require_admin():
+            return
+        test_mode = bool(data.get("test_mode", True))   # default SAFE: test only
+        try:
+            report = winterarc_email.launch_campaign(test_mode=test_mode)
+        except winterarc_email.CampaignError as e:
+            return self._send(e.code, {"error": e.message})
+        self._send(200, {"ok": True, "report": report})
+
     def _admin_email_test(self, data):
         """Send a single retention email to an account (admin only) to verify delivery."""
         if not self._require_admin():
@@ -1394,10 +1494,15 @@ class Handler(BaseHTTPRequestHandler):
             return
         if not self._require_verified(u):
             return
+        interval = data.get("interval", "monthly")
+        # Starter is a one-time ENTRY offer — enforce eligibility on the server so
+        # an existing/returning user can't buy it via a direct API call.
+        if interval == "starter" and not auth.starter_eligible(u):
+            return self._send(403, {"error": "The Starter plan is only available to new members."})
         # No currency handling here — Stripe Adaptive Pricing presents each
         # customer their local currency at checkout from the single base price.
         try:
-            url = billing.create_checkout(auth.public_user(u), data.get("interval", "monthly"),
+            url = billing.create_checkout(auth.public_user(u), interval,
                                           return_base=self.headers.get("Origin", ""))
         except billing.BillingError as e:
             return self._send(503, {"error": str(e)})
