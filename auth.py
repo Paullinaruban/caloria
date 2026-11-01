@@ -84,6 +84,15 @@ def _maybe_rehash(user_id: int, password: str, stored: str) -> None:
 
 # ---------- account lifecycle ----------
 def signup(email: str, password: str, name: str = "") -> dict:
+    # Harden against malformed payloads: a client can POST JSON where these are
+    # not strings (e.g. {"email": ["a@b.com"]}). Calling a string method such as
+    # .strip() on a list/dict/number raises AttributeError and surfaces as an
+    # HTTP 500. Reject non-string fields with a clear 400 instead. Normal
+    # signups (plain strings from the form) are completely unaffected.
+    if name is None:
+        name = ""
+    if not isinstance(email, str) or not isinstance(password, str) or not isinstance(name, str):
+        raise AuthError("Please enter a valid email address and password.", 400)
     email = (email or "").strip().lower()
     if not _EMAIL_RE.match(email):
         raise AuthError("Please enter a valid email address.")
@@ -280,6 +289,11 @@ def _get_user_by_email(email: str):
 
 
 def login(email: str, password: str) -> dict:
+    # Same payload hardening as signup(): a non-string email/password is a
+    # malformed request, not a login attempt. Reject it cleanly (400) rather than
+    # crashing on .strip(). Real logins (plain strings) are unaffected.
+    if not isinstance(email, str) or not isinstance(password, str):
+        raise AuthError("Please enter a valid email address and password.", 400)
     email = (email or "").strip().lower()
     with db.cursor() as c:
         row = c.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
