@@ -62,12 +62,15 @@ STRIPE_PRICE_YEARLY  = os.environ.get("STRIPE_PRICE_YEARLY", "").strip()    # th
 # with $19 emphasized. Every surface — display strings, the Stripe amount in every
 # currency, /api/config, the landing hero/paywalls, and admin MRR — reads the
 # helpers below, so one change updates everything at once. All env-overridable.
-# The actual Stripe charge uses STRIPE_PRICE_MONTHLY (your $19 Price id); if unset,
-# a $19 Price is auto-created from MONTHLY_PRICE_USD. Yearly is fixed at $99.
+# The actual Stripe charge uses STRIPE_PRICE_MONTHLY (your $19.99 Price id); if
+# unset, a Price is auto-created from MONTHLY_PRICE_USD. Yearly is fixed at $99.
 # ============================================================================
 import datetime as _dt
 
-MONTHLY_PRICE_USD_BASE = float(os.environ.get("MONTHLY_PRICE_USD", "19"))     # actual charged price
+# Display/anchor price only — the real charge is the STRIPE_PRICE_MONTHLY Price id
+# set in the environment. Kept in sync with that Price so the UI shows what the
+# customer is actually billed ($19.99).
+MONTHLY_PRICE_USD_BASE = float(os.environ.get("MONTHLY_PRICE_USD", "19.99"))  # display; charge = STRIPE_PRICE_MONTHLY
 MONTHLY_COMPARE_USD    = float(os.environ.get("MONTHLY_COMPARE_USD", "25"))   # struck-through "was" price
 YEARLY_PRICE_USD       = float(os.environ.get("YEARLY_PRICE_USD", "99"))
 

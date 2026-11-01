@@ -221,8 +221,11 @@ def create_checkout(user, interval: str, return_base: str = "") -> str:
         "subscription_data[metadata][tier]": ("starter" if interval == "starter" else "premium"),
     }
     # Free trial — no charge until the trial ends; cancel anytime before then.
-    # Starter is a paid one-month entry, so it never gets a trial.
-    if config.TRIAL_DAYS > 0 and interval != "starter":
+    # Applies to ALL plans (Starter / Premium / Annual). trial_period_days is a
+    # count of DAYS, so the annual plan gets 3 free days, not 3 free months.
+    # Starter's one-month-then-stop behavior is handled AFTER the trial converts
+    # (see handle_event), so the trial never cancels it before the first charge.
+    if config.TRIAL_DAYS > 0:
         params["subscription_data[trial_period_days]"] = config.TRIAL_DAYS
 
     # Deterministic idempotency key bucketed to the reuse window: two requests that
@@ -495,9 +498,12 @@ def handle_event(event: dict) -> None:
                     (new_plan, obj.get("customer"), obj.get("subscription"), interval, now, int(user_id)),
                 )
             clear_pending_checkout(int(user_id))
-            if is_starter and obj.get("subscription"):
-                # Make it NON-RENEWING: bill this one month, then cancel — the
-                # customer is never charged a second time automatically.
+            if is_starter and obj.get("subscription") and config.TRIAL_DAYS <= 0:
+                # No trial: make it NON-RENEWING now — bill this one month, then
+                # cancel. (WITH a trial the subscription is still `trialing` here,
+                # and cancel_at_period_end would cancel at the TRIAL end and never
+                # charge — so for the trial case we defer this to the moment the
+                # trial converts to a paid month: see customer.subscription.updated.)
                 try:
                     _stripe(f"subscriptions/{obj['subscription']}",
                             {"cancel_at_period_end": "true"}, method="POST")
@@ -514,6 +520,19 @@ def handle_event(event: dict) -> None:
         else:
             plan = "free"
         _set_by_customer(obj.get("customer"), plan=plan, status=status, subscription=obj.get("id"))
+        # Starter = ONE paid month, non-renewing. When its trial converts to a
+        # paying month (status leaves `trialing` for `active`), schedule the
+        # end-of-period cancellation exactly once — current_period_end is now the
+        # end of the FIRST PAID month, so the customer is billed once then stops.
+        # Idempotent: skipped if already set. Premium/Annual are never scheduled.
+        if (starter and status == "active" and obj.get("id")
+                and not obj.get("cancel_at_period_end") and config.stripe_ready()):
+            try:
+                _stripe(f"subscriptions/{obj['id']}",
+                        {"cancel_at_period_end": "true"}, method="POST")
+                print(f"[caloria] starter: scheduled non-renewal (post-trial) for sub {obj['id']}")
+            except BillingError as e:
+                print(f"[caloria] starter: could not schedule post-trial non-renewal: {e}")
 
     elif etype in ("customer.subscription.deleted", "customer.subscription.canceled"):
         starter = (obj.get("metadata") or {}).get("tier") == "starter" or _is_starter_customer(obj.get("customer"))
