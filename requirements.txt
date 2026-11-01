@@ -1,3 +1,9 @@
-# Caloria backend uses ONLY the Python standard library — there are no
-# third-party dependencies to install. This file exists so the host (Render)
-# detects the project as Python and provisions the runtime.
+# Caloria backend runtime dependencies (installed by Render from this file).
+#
+# The backend is otherwise pure Python standard library. The ONE third-party
+# dependency is Pillow, required by the AI Coach photo feature (coach.py) to
+# downscale, re-encode and EXIF-strip user-uploaded images before they are sent
+# to the OpenAI vision model. Without it, Coach image messages fail with
+# "Image processing is unavailable right now." Pillow ships prebuilt manylinux
+# wheels for CPython 3.11 (Render's PYTHON_VERSION), so no compilation is needed.
+Pillow==11.3.0

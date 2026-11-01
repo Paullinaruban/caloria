@@ -18,8 +18,14 @@ import llm
 try:
     from PIL import Image
     _PIL = True
-except Exception:  # noqa: BLE001 — Pillow should be present; degrade gracefully if not
+    _PIL_ERR = ""
+except Exception as _e:  # noqa: BLE001 — Pillow must be installed (see requirements.txt)
     _PIL = False
+    _PIL_ERR = f"{type(_e).__name__}: {_e}"
+    # Surface the real reason at boot so a missing/broken Pillow is obvious in the
+    # Render logs rather than only showing up as a user-facing 400 later.
+    print(f"[caloria] coach: Pillow unavailable — image coaching disabled ({_PIL_ERR}). "
+          f"Add 'Pillow' to requirements.txt and redeploy.")
 
 PERSONA = (
     "You are the Supermodel Wellness Coach for Paullina Ruban's Club — a premium, "
@@ -95,7 +101,9 @@ def optimize_image(data_url: str) -> str:
     Returns a `data:image/jpeg;base64,...` URL. Raises ImageError on bad input."""
     if not _PIL:
         # Without Pillow we cannot safely optimize; refuse rather than forward a
-        # full-res image to the model.
+        # full-res image to the model. Log the real cause (never silently drop the
+        # image or fall back to a text-only reply).
+        print(f"[caloria] coach: image rejected — Pillow not importable ({_PIL_ERR})")
         raise ImageError("Image processing is unavailable right now.")
     try:
         head, b64 = data_url.split(",", 1)
