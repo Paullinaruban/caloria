@@ -33,6 +33,9 @@ LIMITS = {
     "email_req_ip_hour": (config.EMAIL_REQ_PER_IP_HOUR, 3600),
     # Native-app verification start (also protected by the X-Caloria-App secret).
     "app_verify": (config.APP_VERIFY_PER_IP_HOUR, 3600),
+    # Pre-account onboarding lead saves (no email sent here; generous per-IP cap
+    # to stop lead-table spam without blocking a real prospect correcting answers).
+    "lead": (30, 3600),
     # Caloria Club: launch traffic arrives from TikTok/Instagram in-app browsers,
     # where whole mobile carriers share a handful of NAT'd IPs — per-IP limits
     # must leave real headroom. Duplicate emails are deduped regardless.

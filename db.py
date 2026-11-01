@@ -330,6 +330,28 @@ def init_db() -> None:
                 sent_at    TEXT DEFAULT CURRENT_TIMESTAMP
             )"""
         )
+        # One-trial-per-account guard (mirrors starter_used). Set when a trialing
+        # subscription is first granted; checked so a user can't restart a trial.
+        _add_column(c, "users", "trial_used", "INTEGER NOT NULL DEFAULT 0")
+        # --- Onboarding leads (pre-account assessment + email) ---
+        # A prospect who finished the 7-step assessment and gave an email but has
+        # not created an account or paid yet. Keyed by an unguessable id so results
+        # survive a refresh and the Stripe customer can later be matched back to the
+        # assessment. Additive + isolated: never touches users/sessions/billing.
+        c.execute(
+            """CREATE TABLE IF NOT EXISTS leads (
+                id              TEXT PRIMARY KEY,
+                email           TEXT,
+                profile_json    TEXT,
+                targets_json    TEXT,
+                stripe_customer TEXT,
+                stripe_session  TEXT,
+                status          TEXT NOT NULL DEFAULT 'new',
+                created_at      TEXT DEFAULT CURRENT_TIMESTAMP,
+                updated_at      TEXT
+            )"""
+        )
+        c.execute("CREATE INDEX IF NOT EXISTS idx_leads_email ON leads(email)")
 
 
 def kv_get(key: str):

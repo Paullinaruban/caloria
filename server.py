@@ -33,6 +33,7 @@ import config
 import db
 import images
 import imagevalid
+import leads
 import learning
 import mealplan
 import pipeline
@@ -235,6 +236,10 @@ class Handler(BaseHTTPRequestHandler):
         # only computes (same nutrition_engine math) and never saves. The answers
         # are attached to the account afterward via the authenticated /api/onboarding.
         "/api/onboarding/preview",
+        # Pre-account onboarding leads: the funnel now captures email + assessment
+        # BEFORE any account (results shown on-site, account created after payment).
+        # No account/session; rate-limited; the lead id is an unguessable token.
+        "/api/lead", "/api/lead/resume",
         # NATIVE iOS onboarding (verify-first). App-gated inside the handlers by the
         # X-Caloria-App secret; no Turnstile. The website flow is untouched.
         "/api/app/verify/start", "/api/app/verify/check", "/api/app/register",
@@ -696,6 +701,8 @@ class Handler(BaseHTTPRequestHandler):
             "/api/auth/reset-check": self._reset_check_code,
             "/api/onboarding": self._onboarding,
             "/api/onboarding/preview": self._onboarding_preview,
+            "/api/lead": self._lead_save,
+            "/api/lead/resume": self._lead_resume,
             "/api/app/verify/start": self._app_verify_start,
             "/api/app/verify/check": self._app_verify_check,
             "/api/app/register": self._app_register,
@@ -945,6 +952,33 @@ class Handler(BaseHTTPRequestHandler):
             print(f"[caloria] onboarding preview failed: {e}")
             return self._send(400, {"error": "We couldn't build your plan. Please try again."})
         self._send(200, {"targets": targets})
+
+    def _lead_save(self, data):
+        """PUBLIC — persist a prospect's email + 7-step assessment as a *lead*
+        BEFORE any account/payment, so results survive a refresh and the Stripe
+        customer can later be matched back. No account, no session, no email sent;
+        the email is NOT treated as verified. Returns an unguessable lead id the
+        client keeps to resume. Rate-limited per IP."""
+        ip = self._client_ip()
+        if self._rate_limited("lead", ip):
+            return
+        if self._email_captcha_failed(data, ip):   # no-op unless TURNSTILE_PROTECT_EMAIL
+            return
+        try:
+            res = leads.create_or_update(data.get("lead_id"), data.get("email"),
+                                         data.get("profile") or {})
+        except leads.LeadError as e:
+            return self._send(400, {"error": str(e)})
+        self._send(200, {"ok": True, "lead_id": res["id"], "email": res["email"]})
+
+    def _lead_resume(self, data):
+        """PUBLIC — return a lead's saved email + assessment by its secret id, so a
+        returning/refreshing prospect keeps her results. 404 if unknown."""
+        lead = leads.get(data.get("lead_id"))
+        if not lead:
+            return self._send(404, {"error": "not found"})
+        self._send(200, {"ok": True, "lead_id": lead["id"], "email": lead["email"],
+                         "profile": lead["profile"], "status": lead["status"]})
 
     # ---- NATIVE iOS onboarding (verify-first) ----
     def _app_gate(self) -> bool:
