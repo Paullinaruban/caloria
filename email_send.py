@@ -15,6 +15,7 @@ import urllib.error
 import urllib.request
 
 import config
+import ratelimit
 
 _RESEND_URL = "https://api.resend.com/emails"
 # Outbound email is retried on transient failures. Without this, a cold DNS/TLS
@@ -30,7 +31,8 @@ class EmailError(RuntimeError):
 
 def _send(to: str, subject: str, html: str, text: str,
           headers: dict | None = None, timeout: int | None = None,
-          trace: str | None = None, idempotency_key: str | None = None) -> str | None:
+          trace: str | None = None, idempotency_key: str | None = None,
+          category: str | None = None) -> str | None:
     """Send one email via Resend. Returns the Resend message id on success (and
     logs it for a delivery audit trail), or None in the dev/console fallback.
     `headers` adds custom SMTP headers (e.g. List-Unsubscribe for bulk sends).
@@ -38,6 +40,14 @@ def _send(to: str, subject: str, html: str, text: str,
     verification path so a signup request can't hang on a slow provider).
     `trace` (e.g. "signup"/"resend") turns on step-by-step diagnostic logging so
     the exact Resend request/response/error for that send is visible in the logs."""
+    # GLOBAL circuit breaker for auth-code emails (verification / password reset):
+    # the vector-independent backstop against IP-rotating, fresh-address abuse of
+    # our Resend account. Checked BEFORE any provider call, so a blocked send never
+    # touches Resend. Non-auth mail (marketing/transactional) is unaffected.
+    if category == "auth" and not ratelimit.auth_email_budget_ok(trace or "auth"):
+        print(f"[email-guard] BLOCKED auth email to={to} subject={subject!r} "
+              f"(global budget/kill-switch) — Resend NOT called", flush=True)
+        return None
     if not config.email_ready():
         # Dev fallback — surface the message so the flow is testable without a key.
         print(f"[caloria][EMAIL:dev] to={to} subject={subject!r}\n{text}\n")
@@ -147,7 +157,7 @@ def send_verification(to: str, link: str) -> None:
         "Welcome to Caloria! Confirm your email to activate your account:\n"
         f"{link}\nThis link expires in {config.VERIFY_TOKEN_TTL_HOURS} hours."
     )
-    _send(to, "Confirm your Caloria email", html, text)
+    _send(to, "Confirm your Caloria email", html, text, category="auth")
 
 
 def send_verification_code(to: str, code: str, timeout: int | None = None,
@@ -170,8 +180,8 @@ def send_verification_code(to: str, code: str, timeout: int | None = None,
         f"Welcome to Caloria! Your email verification code is: {code}\n"
         f"It expires in {config.VERIFY_CODE_TTL_MINUTES} minutes. Don't share it with anyone."
     )
-    _send(to, "Your Caloria verification code", html, text, timeout=timeout,
-          trace=trace, idempotency_key=idempotency_key)
+    return _send(to, "Your Caloria verification code", html, text, timeout=timeout,
+                 trace=trace, idempotency_key=idempotency_key, category="auth")
 
 
 def send_starter_expired(to: str, name: str = "") -> None:
@@ -260,7 +270,7 @@ def send_reset(to: str, link: str) -> None:
         f"{link}\nThis link expires in {config.RESET_TOKEN_TTL_HOURS} hour(s). "
         "If you didn't request it, ignore this email."
     )
-    _send(to, "Reset your Caloria password", html, text)
+    _send(to, "Reset your Caloria password", html, text, category="auth")
 
 
 def send_reset_code(to: str, code: str, idempotency_key: str | None = None) -> None:
@@ -283,5 +293,5 @@ def send_reset_code(to: str, code: str, idempotency_key: str | None = None) -> N
         f"It expires in {config.RESET_CODE_TTL_MINUTES} minutes. "
         "If you didn't request it, ignore this email — your password is unchanged."
     )
-    _send(to, "Your Caloria password reset code", html, text,
-          idempotency_key=idempotency_key)
+    return _send(to, "Your Caloria password reset code", html, text,
+                 idempotency_key=idempotency_key, category="auth")

@@ -127,6 +127,23 @@ class Handler(BaseHTTPRequestHandler):
         }).encode())
         return True
 
+    def _email_ip_limited(self, ip: str) -> bool:
+        """Shared per-IP cap across ALL verification-related endpoints (signup /
+        resend / forgot / change-email): a short window + an hourly window. Sends
+        429 and returns True when exceeded. Prevents an IP from round-robining
+        endpoints to multiply its email budget."""
+        return (self._rate_limited("email_req_ip_short", ip)
+                or self._rate_limited("email_req_ip_hour", ip))
+
+    def _email_captcha_failed(self, data, ip: str) -> bool:
+        """Optional Turnstile check for the non-login email endpoints, gated by
+        TURNSTILE_PROTECT_EMAIL (off by default). Sends 400 and returns True on a
+        missing/invalid token so no email is sent."""
+        if config.TURNSTILE_PROTECT_EMAIL and not turnstile.verify(data.get("captcha_token", ""), ip):
+            self._send(400, {"error": "Bot check failed. Please try again."})
+            return True
+        return False
+
     def _raw_body(self):
         length = int(self.headers.get("Content-Length", 0))
         if length <= 0 or length > MAX_BODY:
@@ -734,7 +751,7 @@ class Handler(BaseHTTPRequestHandler):
     # ---- auth ----
     def _signup(self, data):
         ip = self._client_ip()
-        if self._rate_limited("signup", ip):
+        if self._rate_limited("signup", ip) or self._email_ip_limited(ip):
             return
         if not turnstile.verify(data.get("captcha_token", ""), ip):
             return self._send(400, {"error": "Bot check failed. Please try again."})
@@ -777,7 +794,10 @@ class Handler(BaseHTTPRequestHandler):
         self._send(200, {"ok": True, "verified": True})
 
     def _resend_verification(self, data):
-        if self._rate_limited("resend", self._client_ip()):
+        ip = self._client_ip()
+        if self._rate_limited("resend", ip) or self._email_ip_limited(ip):
+            return
+        if self._email_captcha_failed(data, ip):
             return
         # Prefer the signed-in user; fall back to a supplied email. Always neutral.
         u = self._user()
@@ -792,10 +812,13 @@ class Handler(BaseHTTPRequestHandler):
         """Let a signed-in (typically UNVERIFIED) user correct the email they
         signed up with, then re-send a fresh code to the new address. Requires the
         account's own session token, so it can only change your own email."""
-        if self._rate_limited("change_email", self._client_ip()):
+        ip = self._client_ip()
+        if self._rate_limited("change_email", ip) or self._email_ip_limited(ip):
             return
         u = self._require_user()
         if not u:
+            return
+        if self._email_captcha_failed(data, ip):
             return
         # Per-recipient cooldown + hourly cap (shared "verify" budget) so the new
         # address can't be used to fire off a burst of verification emails.
@@ -809,7 +832,10 @@ class Handler(BaseHTTPRequestHandler):
                          "user": auth.public_user(self._user())})
 
     def _forgot_password(self, data):
-        if self._rate_limited("forgot", self._client_ip()):
+        ip = self._client_ip()
+        if self._rate_limited("forgot", ip) or self._email_ip_limited(ip):
+            return
+        if self._email_captcha_failed(data, ip):
             return
         email = str(data.get("email", ""))
         # Per-recipient cooldown + hourly cap. Keyed on the submitted address only
@@ -1603,7 +1629,15 @@ def main():
     else:
         print("  Stripe: NOT configured")
     print(f"  Email:  {'Resend configured' if config.email_ready() else 'NOT configured (links logged to console)'}")
-    print(f"  Turnstile: {'on' if turnstile.enabled() else 'off (rate-limit only)'}")
+    print(f"  Turnstile: {turnstile.status_note()}")
+    if config.REQUIRE_TURNSTILE and not turnstile.enabled():
+        print("  [WARNING] REQUIRE_TURNSTILE=true but no secret set — signup/login "
+              "will fail closed until TURNSTILE_SECRET is configured.")
+    ks = " [KILL SWITCH ON — auth emails blocked]" if config.AUTH_EMAIL_KILL_SWITCH else ""
+    print(f"  Email guard: global {config.AUTH_EMAIL_HOURLY_MAX}/hr, {config.AUTH_EMAIL_DAILY_MAX}/day; "
+          f"per-recipient {config.VERIFY_EMAIL_HOURLY_MAX}/hr; "
+          f"per-IP {config.EMAIL_REQ_PER_IP_SHORT}/{config.EMAIL_REQ_PER_IP_SHORT_WIN}s,"
+          f"{config.EMAIL_REQ_PER_IP_HOUR}/hr{ks}")
     print(f"  Verify required: {config.REQUIRE_EMAIL_VERIFICATION}  |  DEV_UNLIMITED: {config.DEV_UNLIMITED}")
     print(f"  CORS origin: {config.ALLOWED_ORIGIN}")
     print(f"  Meal images: {'on' if images.available() else 'off'}")

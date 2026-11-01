@@ -305,6 +305,39 @@ EMAIL_RETENTION_ENABLED = os.environ.get("EMAIL_RETENTION_ENABLED", "false").low
 # https://dash.cloudflare.com/?to=/:account/turnstile — site key is public; secret is server-side.
 TURNSTILE_SITE_KEY = os.environ.get("TURNSTILE_SITE_KEY", "").strip()
 TURNSTILE_SECRET = os.environ.get("TURNSTILE_SECRET", "").strip()
+# Also require a Turnstile token on the non-login email endpoints (resend /
+# forgot / change-email). OFF by default so it never breaks a flow whose form
+# does not render a widget yet; enable once those forms show a challenge.
+TURNSTILE_PROTECT_EMAIL = os.environ.get("TURNSTILE_PROTECT_EMAIL", "false").lower() == "true"
+# Fail CLOSED if Turnstile is required but not configured/valid. When true, a
+# missing secret or an invalid token makes verify() return False (requests are
+# rejected) instead of silently passing — so a dropped TURNSTILE_SECRET in
+# production can never silently disable bot protection. OFF by default to keep
+# local dev frictionless; set true in production once the keys are in place.
+REQUIRE_TURNSTILE = os.environ.get("REQUIRE_TURNSTILE", "false").lower() == "true"
+
+# --- Abuse protection: outbound auth-email limits (ALL env-configurable) ---
+# Per-recipient code-email gate: at most one send per cooldown, capped per hour.
+# Keyed on the submitted address (case/space-insensitive), so it reveals nothing
+# about whether an account exists.
+VERIFY_EMAIL_COOLDOWN_SEC = int(os.environ.get("VERIFY_EMAIL_COOLDOWN_SEC", "60"))
+VERIFY_EMAIL_HOURLY_MAX   = int(os.environ.get("VERIFY_EMAIL_HOURLY_MAX", "3"))
+RESET_EMAIL_COOLDOWN_SEC  = int(os.environ.get("RESET_EMAIL_COOLDOWN_SEC", "60"))
+RESET_EMAIL_HOURLY_MAX    = int(os.environ.get("RESET_EMAIL_HOURLY_MAX", "3"))
+# Per-IP cap on verification-related requests (signup / resend / forgot /
+# change-email), across a short and an hourly window. Shared bucket so an IP
+# can't round-robin endpoints to multiply its budget.
+EMAIL_REQ_PER_IP_SHORT      = int(os.environ.get("EMAIL_REQ_PER_IP_SHORT", "5"))      # events
+EMAIL_REQ_PER_IP_SHORT_WIN  = int(os.environ.get("EMAIL_REQ_PER_IP_SHORT_WIN", "600"))  # 10 min
+EMAIL_REQ_PER_IP_HOUR       = int(os.environ.get("EMAIL_REQ_PER_IP_HOUR", "10"))      # events / hour
+# Native-app verification start (app-secret gated, but still per-IP capped).
+APP_VERIFY_PER_IP_HOUR      = int(os.environ.get("APP_VERIFY_PER_IP_HOUR", "10"))     # events / hour
+# GLOBAL circuit breaker — the backstop that survives IP rotation and fresh
+# attacker addresses (per-IP / per-recipient gates can't see global volume).
+# 0 disables a cap. The kill switch blocks ALL auth-code emails instantly.
+AUTH_EMAIL_KILL_SWITCH = os.environ.get("AUTH_EMAIL_KILL_SWITCH", "false").lower() == "true"
+AUTH_EMAIL_HOURLY_MAX  = int(os.environ.get("AUTH_EMAIL_HOURLY_MAX", "300"))
+AUTH_EMAIL_DAILY_MAX   = int(os.environ.get("AUTH_EMAIL_DAILY_MAX", "2000"))
 
 # --- Sessions / CORS / proxy ---
 SESSION_TTL_DAYS = int(os.environ.get("SESSION_TTL_DAYS", "30"))

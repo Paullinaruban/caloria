@@ -20,10 +20,25 @@ def enabled() -> bool:
     return bool(config.TURNSTILE_SECRET)
 
 
+def status_note() -> str:
+    """One-line status for the boot log so Turnstile state is never silent."""
+    if enabled():
+        return "Turnstile ENABLED (bot challenge active on signup/login)."
+    if config.REQUIRE_TURNSTILE:
+        return ("Turnstile REQUIRED but NOT configured — signup/login will be "
+                "REJECTED (fail-closed). Set TURNSTILE_SITE_KEY + TURNSTILE_SECRET.")
+    return ("Turnstile DISABLED (no secret) — bot challenge is OFF; rate limits "
+            "still apply. Set keys + REQUIRE_TURNSTILE=true in production.")
+
+
 def verify(token: str, remote_ip: str | None = None) -> bool:
-    """Return True if the Turnstile token is valid (or if Turnstile is disabled)."""
+    """Return True if the Turnstile token is valid.
+
+    When Turnstile is NOT configured: fail CLOSED (return False) if
+    REQUIRE_TURNSTILE is set, otherwise fail open (return True) for local dev.
+    This prevents a dropped secret from silently disabling bot protection."""
     if not enabled():
-        return True
+        return not config.REQUIRE_TURNSTILE
     if not token:
         return False
     params = {"secret": config.TURNSTILE_SECRET, "response": token}
