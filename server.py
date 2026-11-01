@@ -334,6 +334,11 @@ class Handler(BaseHTTPRequestHandler):
                 "starter_price": config.STARTER_PRICE_DISPLAY,
                 "starter_price_usd": config.STARTER_PRICE_USD,
                 "starter_enabled": config.starter_ready(),
+                # Diagnostic: is Pillow importable in the RUNNING backend? AI Coach
+                # photo analysis needs it; if false, requirements.txt was not
+                # installed (e.g. an empty Render buildCommand). Safe to expose
+                # (a plain boolean, no secrets).
+                "coach_image_ready": bool(getattr(coach, "_PIL", False)),
             })
         if path == "/api/winterarc":
             # Premium-gated automatically (not in _PUBLIC_PATHS). Returns the

@@ -20,7 +20,10 @@ services:
     name: caloria-api
     runtime: python
     plan: starter
-    buildCommand: ""
+    # MUST install requirements (Pillow, for AI Coach image processing). An empty
+    # build command makes Render skip the build step entirely, so requirements.txt
+    # is never installed — that is why Coach photos failed in production.
+    buildCommand: "pip install -r requirements.txt"
     startCommand: python server.py
     healthCheckPath: /api/health
 
