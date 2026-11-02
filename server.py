@@ -38,6 +38,7 @@ import learning
 import mealplan
 import pipeline
 import ratelimit
+import recovery
 import revenuecat
 import turnstile
 import usage
@@ -246,6 +247,8 @@ class Handler(BaseHTTPRequestHandler):
         "/api/app/iap/grant",
         # Winter Arc one-click product-announcement unsubscribe (token-based).
         "/api/winterarc/unsubscribe",
+        # Recovery/marketing one-click unsubscribe (token-based, public).
+        "/api/recovery/unsubscribe",
     })
 
     # Signed-in pre-paywall funnel: reachable by an AUTHENTICATED user who has not
@@ -351,11 +354,10 @@ class Handler(BaseHTTPRequestHandler):
                 "iap_enabled": config.revenuecat_ready(),
                 # Seasonal layer flags (snow / card / animations / enabled).
                 "winter_arc": config.winter_arc_public(),
-                # Starter entry plan (shown to eligible new users only; eligibility
-                # itself is per-user via /api/me → starter_eligible).
-                "starter_price": config.STARTER_PRICE_DISPLAY,
-                "starter_price_usd": config.STARTER_PRICE_USD,
-                "starter_enabled": config.starter_ready(),
+                # NOTE: the retired Starter plan is intentionally NOT advertised to
+                # the client. Pricing is exactly two options — $19.99/mo and $99/yr.
+                # Existing Starter subscribers keep access via their own plan flag
+                # (/api/me), which does not depend on these config fields.
                 # Diagnostic: is Pillow importable in the RUNNING backend? AI Coach
                 # photo analysis needs it; if false, requirements.txt was not
                 # installed (e.g. an empty Render buildCommand). Safe to expose
@@ -378,6 +380,11 @@ class Handler(BaseHTTPRequestHandler):
             qs = parse_qs(urlparse(self.path).query)
             ok = winterarc_email.unsubscribe((qs.get("t") or [""])[0])
             return self._send_html(200, winterarc_email.unsubscribe_page(ok))
+        if path == "/api/recovery/unsubscribe":
+            # One-click marketing opt-out for recovery emails (public, token-based).
+            qs = parse_qs(urlparse(self.path).query)
+            ok = recovery.unsubscribe((qs.get("t") or [""])[0])
+            return self._send_html(200, recovery.unsubscribe_page(ok))
         if path == "/api/me":
             u = self._require_user()
             if u:
@@ -503,6 +510,12 @@ class Handler(BaseHTTPRequestHandler):
             if not self._require_admin():
                 return
             return self._send(200, admin.community_moderation())
+        if path == "/api/admin/leads":
+            # Leads & conversion analytics: funnel counts + searchable lead records.
+            if not self._require_admin():
+                return
+            qs = parse_qs(urlparse(self.path).query)
+            return self._send(200, recovery.admin_leads((qs.get("q") or [""])[0]))
         # ---- Caloria Club (founding members) ----
         if path == "/api/club/stats":
             return self._send(200, club.stats())      # public — powers social proof
@@ -763,9 +776,14 @@ class Handler(BaseHTTPRequestHandler):
         if not turnstile.verify(data.get("captcha_token", ""), ip):
             return self._send(400, {"error": "Bot check failed. Please try again."})
         try:
-            self._send(200, auth.signup(data.get("email"), data.get("password"), data.get("name", "")))
+            res = auth.signup(data.get("email"), data.get("password"), data.get("name", ""))
         except auth.AuthError as e:
-            self._send(e.code, {"error": e.message})
+            return self._send(e.code, {"error": e.message})
+        try:  # additive: a lead that becomes an account stops the marketing email
+            recovery.on_user_registered(res["user"]["email"], res["user"]["id"])
+        except Exception as e:  # noqa: BLE001 — must never break signup
+            print(f"[caloria][recovery] on_user_registered failed: {e}")
+        self._send(200, res)
 
     def _login(self, data):
         ip = self._client_ip()
@@ -798,6 +816,10 @@ class Handler(BaseHTTPRequestHandler):
                 "error": "That code is incorrect or has expired. "
                          "Please check the code or request a new one.",
             })
+        try:  # additive: verified → Email C (incomplete registration) no longer applies
+            recovery.on_email_verified(email)
+        except Exception as e:  # noqa: BLE001 — must never break verification
+            print(f"[caloria][recovery] on_email_verified failed: {e}")
         self._send(200, {"ok": True, "verified": True})
 
     def _resend_verification(self, data):
@@ -965,8 +987,12 @@ class Handler(BaseHTTPRequestHandler):
         if self._email_captcha_failed(data, ip):   # no-op unless TURNSTILE_PROTECT_EMAIL
             return
         try:
-            res = leads.create_or_update(data.get("lead_id"), data.get("email"),
-                                         data.get("profile") or {})
+            res = leads.create_or_update(
+                data.get("lead_id"), data.get("email"), data.get("profile") or {},
+                # EXPLICIT marketing opt-in only — entering an email never on its
+                # own grants consent for the re-engagement email (Email A).
+                marketing_consent=bool(data.get("marketing_consent")),
+                source=str(data.get("source") or "popup")[:40])
         except leads.LeadError as e:
             return self._send(400, {"error": str(e)})
         self._send(200, {"ok": True, "lead_id": res["id"], "email": res["email"]})
@@ -1571,6 +1597,10 @@ class Handler(BaseHTTPRequestHandler):
                                           return_base=self.headers.get("Origin", ""))
         except billing.BillingError as e:
             return self._send(503, {"error": str(e)})
+        try:  # additive: arms the abandoned-checkout email (Email B) for this user
+            recovery.record_checkout_started(u["id"], interval)
+        except Exception as e:  # noqa: BLE001 — must never break checkout
+            print(f"[caloria][recovery] record_checkout_started failed: {e}")
         self._send(200, {"url": url})
 
     def _billing_confirm(self, data):
@@ -1583,6 +1613,10 @@ class Handler(BaseHTTPRequestHandler):
             billing.confirm_checkout(u, str(data.get("session_id", "")))
         except Exception as e:  # noqa: BLE001 — never 500 the return flow
             print(f"[caloria] billing confirm error: {e}")
+        try:  # additive: close the abandoned-checkout window on the success return
+            recovery.mark_checkout_completed(u["id"])
+        except Exception as e:  # noqa: BLE001
+            print(f"[caloria][recovery] mark_checkout_completed failed: {e}")
         self._send(200, {"user": auth.public_user(self._user())})   # refreshed post-activation
 
     def _billing_portal(self, data):
@@ -1603,6 +1637,16 @@ class Handler(BaseHTTPRequestHandler):
             billing.handle_event(event)
         except billing.BillingError as e:
             return self._send(400, {"error": str(e)})
+        # Additive (post-billing): close the abandoned-checkout window so Email B
+        # is suppressed. Suppression also reads live user state, so this is only
+        # bookkeeping; billing.handle_event above is the source of truth.
+        try:
+            if event.get("type") == "checkout.session.completed":
+                ref = (event.get("data", {}).get("object", {}) or {}).get("client_reference_id")
+                if ref and str(ref).isdigit():
+                    recovery.mark_checkout_completed(int(ref))
+        except Exception as e:  # noqa: BLE001
+            print(f"[caloria][recovery] mark_checkout_completed failed: {e}")
         self._send(200, {"received": True})
 
     def _rc_webhook(self):
@@ -1645,6 +1689,10 @@ def main():
     club.init()   # backfill canonical emails for pre-existing club members
     # Retention-email scheduler (daemon). Only auto-sends when EMAIL_RETENTION_ENABLED.
     threading.Thread(target=mailer.run_scheduler, daemon=True).start()
+    # Recovery/conversion-email scheduler (daemon). Only auto-sends when
+    # RECOVERY_EMAILS_ENABLED (default OFF); in test mode delivery is restricted
+    # to RECOVERY_TEST_EMAILS so nothing can escape before production approval.
+    threading.Thread(target=recovery.run_scheduler, daemon=True).start()
     httpd = ThreadingHTTPServer((config.HOST, config.PORT), Handler)
     print(f"Caloria API on http://{config.HOST}:{config.PORT}")
     print(f"  OpenAI: {'configured' if config.openai_ready() else 'NOT configured'} "
@@ -1672,6 +1720,14 @@ def main():
           f"per-recipient {config.VERIFY_EMAIL_HOURLY_MAX}/hr; "
           f"per-IP {config.EMAIL_REQ_PER_IP_SHORT}/{config.EMAIL_REQ_PER_IP_SHORT_WIN}s,"
           f"{config.EMAIL_REQ_PER_IP_HOUR}/hr{ks}")
+    if config.RECOVERY_EMAILS_ENABLED:
+        tm = (f"TEST MODE → {len(config.RECOVERY_TEST_EMAILS)} inbox(es) only"
+              if config.RECOVERY_TEST_EMAILS else "LIVE (all recipients)")
+        print(f"  Recovery emails: ENABLED [{tm}] — A@{config.RECOVERY_EMAIL_A_MINUTES}m "
+              f"B@{config.RECOVERY_EMAIL_B_MINUTES}m C@{config.RECOVERY_EMAIL_C_MINUTES}m, "
+              f"tick {config.RECOVERY_TICK_SECONDS}s, max {config.RECOVERY_MAX_PER_TICK}/tick")
+    else:
+        print("  Recovery emails: disabled (RECOVERY_EMAILS_ENABLED=false)")
     print(f"  Verify required: {config.REQUIRE_EMAIL_VERIFICATION}  |  DEV_UNLIMITED: {config.DEV_UNLIMITED}")
     print(f"  CORS origin: {config.ALLOWED_ORIGIN}")
     print(f"  Meal images: {'on' if images.available() else 'off'}")

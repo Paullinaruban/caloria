@@ -352,6 +352,41 @@ def init_db() -> None:
             )"""
         )
         c.execute("CREATE INDEX IF NOT EXISTS idx_leads_email ON leads(email)")
+        # --- Recovery & conversion funnel (additive, see recovery.py) ----------
+        # Independent tracking of the three funnel stages so suppression is exact:
+        #   • a lead (email captured, NO account)        -> Email A  (marketing)
+        #   • a user who STARTED checkout, never paid     -> Email B  (abandoned)
+        #   • a user registered but email NOT verified    -> Email C  (incomplete)
+        # These columns never alter existing rows and are read-only w.r.t. billing.
+        _add_column(c, "leads", "source", "TEXT")                     # where the lead came from
+        _add_column(c, "leads", "marketing_consent", "INTEGER NOT NULL DEFAULT 0")  # explicit opt-in
+        _add_column(c, "leads", "registered_user_id", "INTEGER")      # set once they create an account
+        _add_column(c, "leads", "email_verified_at", "TEXT")          # set once that account verifies
+        _add_column(c, "leads", "unsubscribed", "INTEGER NOT NULL DEFAULT 0")  # marketing opt-out
+        # One open checkout attempt per user. started_at is set when the user asks
+        # the server to create a Checkout Session; completion is inferred from the
+        # live users row (the Stripe webhook maintains plan/subscription_status),
+        # so billing.py is never touched. completed_at is best-effort bookkeeping.
+        c.execute(
+            """CREATE TABLE IF NOT EXISTS checkout_attempts (
+                user_id      INTEGER PRIMARY KEY,
+                interval     TEXT,
+                started_at   TEXT DEFAULT CURRENT_TIMESTAMP,
+                completed_at TEXT
+            )"""
+        )
+        # Per-(entity, email) ledger — claim-before-send makes every recovery email
+        # idempotent across retries, redeploys and repeated ticks. `ref` is the lead
+        # id for Email A, or 'user:<id>' for Emails B and C. One send per (ref,type).
+        c.execute(
+            """CREATE TABLE IF NOT EXISTS recovery_email_sends (
+                ref        TEXT NOT NULL,
+                email_type TEXT NOT NULL,           -- 'email_a' | 'email_b' | 'email_c'
+                status     TEXT NOT NULL DEFAULT 'sent',  -- sent | failed
+                sent_at    TEXT DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (ref, email_type)
+            )"""
+        )
 
 
 def kv_get(key: str):

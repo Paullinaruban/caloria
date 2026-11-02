@@ -473,12 +473,20 @@ def openai_ready() -> bool:
 STARTER_PRICE_USD     = float(os.environ.get("STARTER_PRICE_USD", "11.99"))
 STARTER_PRICE_DISPLAY = f"${STARTER_PRICE_USD:.2f}"
 STRIPE_PRICE_STARTER  = os.environ.get("STRIPE_PRICE_STARTER", "").strip()
+# Caloria Starter is DISCONTINUED as a public option (off by default). Existing
+# Starter subscribers are unaffected; only new Starter checkouts are blocked.
+STARTER_ENABLED       = os.environ.get("STARTER_ENABLED", "false").lower() == "true"
 
 
 def starter_ready() -> bool:
     """Starter can be offered only when Stripe is configured AND a Starter Price
-    id is set (we never auto-create the Starter price)."""
-    return bool(STRIPE_SECRET_KEY and STRIPE_PRICE_STARTER)
+    id is set (we never auto-create the Starter price) AND it's enabled.
+
+    Caloria Starter has been discontinued as a public purchase option. It is OFF
+    by default (STARTER_ENABLED=false); set STARTER_ENABLED=true to re-enable.
+    This gates only NEW purchases — existing Starter subscribers keep their plan
+    and entitlements untouched (that logic lives in auth.tier/has_ai)."""
+    return bool(STARTER_ENABLED and STRIPE_SECRET_KEY and STRIPE_PRICE_STARTER)
 
 
 def stripe_ready() -> bool:
@@ -533,6 +541,32 @@ WINTER_ARC_CAMPAIGN_ID = os.environ.get("WINTER_ARC_CAMPAIGN_ID", "winter_arc_20
 WINTER_ARC_TEST_EMAILS = {
     e.strip().lower() for e in os.environ.get("WINTER_ARC_TEST_EMAILS", "").split(",") if e.strip()
 }
+
+
+# --- Recovery & conversion emails (lead / abandoned-checkout / incomplete-reg) ---
+# A background daemon (recovery.py) nudges people who dropped out of the funnel.
+# OFF by default: nothing sends until RECOVERY_EMAILS_ENABLED=true AND a Resend key
+# is configured. While testing, set RECOVERY_TEST_EMAILS to your own inbox — the
+# scheduler then only emails those addresses, so nothing can escape.
+RECOVERY_EMAILS_ENABLED = os.environ.get("RECOVERY_EMAILS_ENABLED", "false").lower() == "true"
+RECOVERY_TEST_EMAILS = {
+    e.strip().lower() for e in os.environ.get("RECOVERY_TEST_EMAILS", "").split(",") if e.strip()
+}
+# Delay (minutes) before each email becomes due, measured from the relevant event.
+RECOVERY_EMAIL_A_MINUTES = int(os.environ.get("RECOVERY_EMAIL_A_MINUTES", "30"))  # email captured, no account
+RECOVERY_EMAIL_B_MINUTES = int(os.environ.get("RECOVERY_EMAIL_B_MINUTES", "60"))  # abandoned checkout
+RECOVERY_EMAIL_C_MINUTES = int(os.environ.get("RECOVERY_EMAIL_C_MINUTES", "60"))  # registered, not verified
+# A candidate older than this (hours) is stale — we stop trying so we never email
+# someone days later about a long-forgotten session.
+RECOVERY_MAX_AGE_HOURS = int(os.environ.get("RECOVERY_MAX_AGE_HOURS", "72"))
+# Scheduler cadence + a hard per-tick send ceiling (Resend reputation guard).
+RECOVERY_TICK_SECONDS = int(os.environ.get("RECOVERY_TICK_SECONDS", "300"))
+RECOVERY_MAX_PER_TICK = int(os.environ.get("RECOVERY_MAX_PER_TICK", "50"))
+
+
+def recovery_ready() -> bool:
+    """The recovery daemon only auto-sends when explicitly enabled AND email works."""
+    return bool(RECOVERY_EMAILS_ENABLED and email_ready())
 
 
 def winter_arc_public() -> dict:
