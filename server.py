@@ -45,6 +45,7 @@ import usage
 import vision
 import winterarc
 import winterarc_email
+import winter_update_email
 import workout
 
 MAX_BODY = 16 * 1024 * 1024
@@ -572,6 +573,15 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, club.campaign_recipients((qs.get("kind") or [""])[0]))
             except club.ClubError as e:
                 return self._send(e.code, {"error": e.message})
+        if path == "/api/admin/winterupdate/audience":
+            # READ-ONLY: eligible recipient count + exclusion breakdown for the
+            # Winter Update campaign. Queries `users` only; sends nothing.
+            if not self._require_admin():
+                return
+            try:
+                return self._send(200, winter_update_email.audience_breakdown())
+            except Exception as e:  # noqa: BLE001 — surface cleanly, never 500 raw
+                return self._send(503, {"error": f"audience read failed: {e}"})
         if path == "/api/club/admin/health":
             # Launch-control status card: API (reaching this = up), database
             # (live read+write probe), email service (config + today's volume).
@@ -760,6 +770,10 @@ class Handler(BaseHTTPRequestHandler):
             "/api/winterarc/start": self._winterarc_start,
             "/api/winterarc/complete": self._winterarc_complete,
             "/api/admin/winterarc/launch": self._winterarc_launch,
+            # Winter Update broadcast — admin-only; disabled by default
+            # (WINTER_UPDATE_ENABLED) and test_mode-safe inside the module.
+            "/api/admin/winterupdate/test": self._winterupdate_test,
+            "/api/admin/winterupdate/launch": self._winterupdate_launch,
         }
         handler = routes.get(path)
         if handler:
@@ -1519,6 +1533,44 @@ class Handler(BaseHTTPRequestHandler):
         try:
             report = winterarc_email.launch_campaign(test_mode=test_mode)
         except winterarc_email.CampaignError as e:
+            return self._send(e.code, {"error": e.message})
+        self._send(200, {"ok": True, "report": report})
+
+    def _winterupdate_test(self, data):
+        """Admin-only: send ONE Winter Update test email to the signed-in admin
+        (or an explicit `to`). Never logged in the ledger, so it doesn't affect
+        the real audience or dedupe. Uses the approved design (variant 'a')."""
+        u = self._require_admin()
+        if not u:
+            return
+        to = str(data.get("to", "")).strip().lower() or u["email"]
+        variant = str(data.get("variant", "a")).strip() or "a"
+        subject = data.get("subject")  # None → the approved default subject
+        try:
+            res = winter_update_email.send_test(
+                to, variant=variant, subject=(str(subject) if subject else None))
+        except Exception as e:  # noqa: BLE001 — surface provider errors cleanly
+            print(f"[caloria][winterupdate] test email failed: {e}")
+            return self._send(503, {"error": "The test email could not be sent. Please try again."})
+        self._send(200, res)
+
+    def _winterupdate_launch(self, data):
+        """Admin-only, intentional launch of the Winter Update broadcast.
+        Gated: WINTER_UPDATE_ENABLED must be true; test_mode (default True)
+        restricts to the configured test recipients; the per-recipient ledger
+        makes it idempotent. `exclude_subscribers` defaults True (active
+        subscribers are left out, per the approved audience)."""
+        if not self._require_admin():
+            return
+        test_mode = bool(data.get("test_mode", True))          # default SAFE: test only
+        exclude_subscribers = bool(data.get("exclude_subscribers", True))
+        variant = str(data.get("variant", "a")).strip() or "a"  # approved design
+        limit = data.get("limit")
+        try:
+            report = winter_update_email.launch_campaign(
+                test_mode=test_mode, limit=limit,
+                exclude_subscribers=exclude_subscribers, variant=variant)
+        except winter_update_email.CampaignError as e:
             return self._send(e.code, {"error": e.message})
         self._send(200, {"ok": True, "report": report})
 

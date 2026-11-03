@@ -542,6 +542,18 @@ WINTER_ARC_TEST_EMAILS = {
     e.strip().lower() for e in os.environ.get("WINTER_ARC_TEST_EMAILS", "").split(",") if e.strip()
 }
 
+# A one-off re-engagement campaign to the whole eligible user base. OFF by
+# default: the real send is refused unless WINTER_UPDATE_ENABLED=true (and email
+# is configured). In test mode the send is restricted to WINTER_UPDATE_TEST_EMAILS
+# (falls back to the Winter Arc test inbox list) so nothing can escape in testing.
+WINTER_UPDATE_ENABLED     = os.environ.get("WINTER_UPDATE_ENABLED", "false").lower() == "true"
+WINTER_UPDATE_CAMPAIGN_ID = os.environ.get("WINTER_UPDATE_CAMPAIGN_ID", "winter_update_2026").strip()
+WINTER_UPDATE_TEST_EMAILS = {
+    e.strip().lower()
+    for e in os.environ.get("WINTER_UPDATE_TEST_EMAILS", os.environ.get("WINTER_ARC_TEST_EMAILS", "")).split(",")
+    if e.strip()
+}
+
 
 # --- Recovery & conversion emails (lead / abandoned-checkout / incomplete-reg) ---
 # A background daemon (recovery.py) nudges people who dropped out of the funnel.
