@@ -333,6 +333,20 @@ def init_db() -> None:
         # One-trial-per-account guard (mirrors starter_used). Set when a trialing
         # subscription is first granted; checked so a user can't restart a trial.
         _add_column(c, "users", "trial_used", "INTEGER NOT NULL DEFAULT 0")
+        # Cross-account trial-abuse ledger: the card fingerprint (stable across
+        # Stripe customers for the same physical card) of every payment method that
+        # has already consumed a 3-day trial. A trial started on a NEW account whose
+        # card matches an entry here is ended immediately (charged now) rather than
+        # granting a second free trial. Best-effort deterrent — a different card on a
+        # new email will not match (see billing._customer_card_fingerprint).
+        c.execute(
+            """CREATE TABLE IF NOT EXISTS trial_fingerprints (
+                fingerprint TEXT PRIMARY KEY,
+                user_id     INTEGER,
+                customer    TEXT,
+                created_at  TEXT DEFAULT CURRENT_TIMESTAMP
+            )"""
+        )
         # --- Onboarding leads (pre-account assessment + email) ---
         # A prospect who finished the 7-step assessment and gave an email but has
         # not created an account or paid yet. Keyed by an unguessable id so results

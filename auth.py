@@ -467,6 +467,20 @@ def starter_eligible(row) -> bool:
             and not _row_get(row, "stripe_subscription"))
 
 
+def trial_eligible(row) -> bool:
+    """The 3-day free trial is a ONE-TIME offer for genuinely new, never-subscribed
+    accounts. Anyone who has already used a trial, ever subscribed, or has a Stripe
+    subscription on record is charged immediately with NO trial. Mirrors
+    starter_eligible. (Account-level guarantee; the card-fingerprint check in
+    billing handles the same person returning under a different email.)"""
+    import config
+    if config.TRIAL_DAYS <= 0:
+        return False
+    return (not _row_get(row, "trial_used")
+            and not _row_get(row, "subscribed_at")
+            and not _row_get(row, "stripe_subscription"))
+
+
 def grant_founding_if_invited(user_id: int, email: str) -> bool:
     """Permanently grant the Founding Member badge to EVERYONE who joins while
     the launch window is open (before FOUNDING_MEMBER_DEADLINE), plus anyone on
@@ -516,6 +530,9 @@ def _public_user(row) -> dict:
         "tier": t,
         "has_ai": has_ai(row),
         "starter_eligible": starter_eligible(row),
+        # Whether to show "Start 3-day free trial" vs "Subscribe — billed now".
+        # Display only; the real gate is server-side in billing.create_checkout.
+        "trial_eligible": trial_eligible(row),
         "is_admin": (row["email"] or "").lower() in config.ADMIN_EMAILS,
         "dev_unlimited": config.DEV_UNLIMITED,
         "founding_member": is_founding(row),

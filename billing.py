@@ -220,13 +220,32 @@ def create_checkout(user, interval: str, return_base: str = "") -> str:
         # Premium on a later subscription.updated event.
         "subscription_data[metadata][tier]": ("starter" if interval == "starter" else "premium"),
     }
-    # Free trial — no charge until the trial ends; cancel anytime before then.
-    # Applies to ALL plans (Starter / Premium / Annual). trial_period_days is a
-    # count of DAYS, so the annual plan gets 3 free days, not 3 free months.
-    # Starter's one-month-then-stop behavior is handled AFTER the trial converts
-    # (see handle_event), so the trial never cancels it before the first charge.
-    if config.TRIAL_DAYS > 0:
+    # Reuse this user's existing Stripe customer so a returning subscriber maps to
+    # ONE customer (no duplicates) and their history is preserved. A brand-new user
+    # has none yet, so Checkout creates one from customer_email. Stripe rejects
+    # `customer` and `customer_email` together, so drop the email when reusing.
+    existing_customer = _row(user, "stripe_customer")
+    if existing_customer:
+        params["customer"] = existing_customer
+        params.pop("customer_email", None)
+
+    # Free trial — ONE-TIME, new-account-only. trial_eligible() blocks a second
+    # trial for anyone who has used one, ever subscribed, or has a Stripe
+    # subscription on record (returning customers are charged immediately). The
+    # cross-account (same card, new email) case is caught post-checkout by the
+    # fingerprint guard in handle_event. trial_period_days is a count of DAYS, so
+    # the annual plan gets 3 free days, not 3 free months.
+    import auth
+    grant_trial = config.TRIAL_DAYS > 0 and auth.trial_eligible(user)
+    if grant_trial:
         params["subscription_data[trial_period_days]"] = config.TRIAL_DAYS
+        # Stamp both the session and the subscription so the webhook can record
+        # trial_used reliably regardless of event ordering.
+        params["metadata[trial_granted]"] = "1"
+        params["subscription_data[metadata][trial_granted]"] = "1"
+    else:
+        print(f"[caloria] checkout: no trial for user {user['id']} "
+              f"(ineligible/returning) — immediate charge")
 
     # Deterministic idempotency key bucketed to the reuse window: two requests that
     # slip past the cache check at the same instant still collapse to ONE session
@@ -267,6 +286,19 @@ def confirm_checkout(user, session_id: str) -> bool:
     paid = (s.get("payment_status") == "paid") or (s.get("status") == "complete")
     if not paid:
         return False
+    # If a subscription was created, trust its LIVE status over the session's. A
+    # trial we canceled for card-reuse (see _enforce_trial_fingerprint) must not be
+    # re-activated by this redirect path — only active/trialing subscriptions grant.
+    sub_id = s.get("subscription")
+    if sub_id and config.stripe_ready():
+        try:
+            sub = _stripe(f"subscriptions/{sub_id}", method="GET")
+            if (sub.get("status") or "").lower() not in _ACTIVE_STATUSES:
+                print(f"[caloria] confirm_checkout: subscription {sub_id} is "
+                      f"{sub.get('status')} — not activating")
+                return False
+        except BillingError:
+            pass  # transient lookup failure → fall back to session-based activation
     interval = (s.get("metadata") or {}).get("plan_interval")
     now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     with db.cursor() as c:
@@ -474,6 +506,98 @@ def _send_starter_expiry(user_id: int) -> None:
         print(f"[caloria] starter expiry email failed user={user_id}: {e}")
 
 
+def _customer_card_fingerprint(customer: str):
+    """Best-effort card fingerprint of the customer's default payment method. The
+    fingerprint is stable across Stripe customers for the same physical card, so it
+    lets us recognise the same person returning under a new email. Returns None when
+    it can't be determined (never raises)."""
+    if not (customer and config.stripe_ready()):
+        return None
+    try:
+        cust = _stripe(f"customers/{customer}",
+                       {"expand[]": "invoice_settings.default_payment_method"},
+                       method="GET")
+        pm = (cust.get("invoice_settings") or {}).get("default_payment_method")
+        if isinstance(pm, dict):
+            fp = (pm.get("card") or {}).get("fingerprint")
+            if fp:
+                return fp
+    except BillingError:
+        pass
+    try:  # fallback: first card payment method attached to the customer
+        pms = _stripe("payment_methods",
+                      {"customer": customer, "type": "card"}, method="GET")
+        for pm in (pms.get("data") or []):
+            fp = (pm.get("card") or {}).get("fingerprint")
+            if fp:
+                return fp
+    except BillingError:
+        pass
+    return None
+
+
+def _enforce_trial_fingerprint(customer: str, subscription_id: str) -> None:
+    """Cross-account trial guard. If this trialing subscription's card already
+    consumed a trial on a DIFFERENT customer, end the trial now so Stripe charges
+    immediately (no second free trial). Otherwise record the fingerprint. Fail-open:
+    any error leaves the trial intact, so a genuine customer is never blocked."""
+    if not subscription_id:
+        return
+    fp = _customer_card_fingerprint(customer)
+    if not fp:
+        return
+    try:
+        with db.cursor() as c:
+            row = c.execute(
+                "SELECT customer FROM trial_fingerprints WHERE fingerprint=?", (fp,)
+            ).fetchone()
+    except Exception as e:  # noqa: BLE001
+        print(f"[caloria] trial: fingerprint lookup failed: {e}")
+        return
+    prior_customer = row["customer"] if row else None
+    if prior_customer and prior_customer != customer:
+        if not config.TRIAL_FINGERPRINT_ENFORCE:
+            # LOG-ONLY (default): detect + log the reuse, but take NO action — no
+            # cancel, no charge, no account/plan change. Lets the guard be observed
+            # against real traffic before it ever touches a subscription.
+            print(f"[caloria] trial: LOG-ONLY fingerprint reuse ({fp[:8]}…) — WOULD "
+                  f"cancel trial for sub {subscription_id} (customer {customer}); "
+                  f"no action taken (set TRIAL_FINGERPRINT_ENFORCE=true to enforce)")
+            _log_event("trial.fingerprint_reuse_logonly", customer, "detected_no_action")
+            return
+        # ENFORCE mode. Do NOT charge. Cancel the trialing subscription with no invoice, mark the
+        # account's trial as used, and let it fall to free. The frontend then sees
+        # trial_eligible=false and tells the user the trial is unavailable — they
+        # must explicitly subscribe at the regular price, which only then charges
+        # (on their click). The subscription.deleted webhook this cancel emits
+        # converges the cached plan to free regardless of webhook ordering.
+        try:
+            _stripe(f"subscriptions/{subscription_id}", method="DELETE",
+                    idempotency_key=f"trialblock_{subscription_id}")
+            print(f"[caloria] trial: fingerprint reuse ({fp[:8]}…) — canceled trial "
+                  f"(no charge) for sub {subscription_id}")
+            _log_event("trial.fingerprint_reuse", customer, "trial_blocked_no_charge")
+        except BillingError as e:
+            print(f"[caloria] trial: could not cancel reused trial {subscription_id}: {e}")
+        try:
+            with db.cursor() as c:
+                c.execute("UPDATE users SET trial_used=1, plan='free', "
+                          "subscription_status='canceled' WHERE stripe_customer=?",
+                          (customer,))
+        except Exception as e:  # noqa: BLE001
+            print(f"[caloria] trial: could not mark trial_used after block: {e}")
+        return
+    if not prior_customer:
+        try:
+            with db.cursor() as c:
+                c.execute(
+                    "INSERT OR IGNORE INTO trial_fingerprints (fingerprint, customer) "
+                    "VALUES (?, ?)", (fp, customer),
+                )
+        except Exception as e:  # noqa: BLE001
+            print(f"[caloria] trial: could not record fingerprint: {e}")
+
+
 def handle_event(event: dict) -> None:
     etype = event.get("type")
     obj = event.get("data", {}).get("object", {})
@@ -497,6 +621,12 @@ def handle_event(event: dict) -> None:
                     + " WHERE id=?",
                     (new_plan, obj.get("customer"), obj.get("subscription"), interval, now, int(user_id)),
                 )
+            # One-time trial guard: if THIS checkout granted a trial (stamped at
+            # create_checkout), mark the account so a later checkout can't get a
+            # second one. Keyed by user_id, so it is reliable regardless of order.
+            if (obj.get("metadata") or {}).get("trial_granted") == "1":
+                with db.cursor() as c:
+                    c.execute("UPDATE users SET trial_used=1 WHERE id=?", (int(user_id),))
             clear_pending_checkout(int(user_id))
             if is_starter and obj.get("subscription") and config.TRIAL_DAYS <= 0:
                 # No trial: make it NON-RENEWING now — bill this one month, then
@@ -510,6 +640,25 @@ def handle_event(event: dict) -> None:
                     print(f"[caloria] starter: scheduled non-renewal for user {user_id}")
                 except BillingError as e:
                     print(f"[caloria] starter: could not schedule non-renewal: {e}")
+
+    elif etype == "customer.subscription.created":
+        # A new subscription. If it started in a trial, run the cross-account guard:
+        # a card that already consumed a trial (on ANY customer) has its trial ended
+        # now so Stripe charges immediately. Also stamp trial_used on the owning
+        # account as a backup to checkout.session.completed (webhook order varies).
+        customer = obj.get("customer")
+        if obj.get("status") == "trialing" and customer:
+            _enforce_trial_fingerprint(customer, obj.get("id"))
+        if (obj.get("metadata") or {}).get("trial_granted") == "1" and customer:
+            with db.cursor() as c:
+                c.execute("UPDATE users SET trial_used=1 WHERE stripe_customer=?", (customer,))
+
+    elif etype == "customer.subscription.trial_will_end":
+        # Informational reminder (~3 days before trial end; for a 3-day trial it is
+        # effectively immediate). The actual trial→paid conversion arrives as
+        # customer.subscription.updated, so we only log here — no plan change, no
+        # email (wire a reminder later if desired).
+        print(f"[caloria] trial_will_end for customer {obj.get('customer')}")
 
     elif etype == "customer.subscription.updated":
         # Tier-aware: a Starter subscription stays Starter (never auto-upgraded).

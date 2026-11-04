@@ -424,6 +424,14 @@ ADMIN_EMAILS = {
 # No free trials. 0 disables the trial entirely (paid from day one).
 TRIAL_DAYS = int(os.environ.get("TRIAL_DAYS", "0"))
 
+# Cross-account trial-abuse enforcement mode for the card-fingerprint guard.
+# DEFAULT false = LOG-ONLY: repeated card fingerprints are detected, recorded and
+# logged, but NO subscription is canceled, NO trial ended, NO charge made — so the
+# guard can be observed safely against live traffic before it acts. Set to true to
+# ENFORCE (cancel a reused-card trial with no charge). The account-level one-trial
+# guard (trial_eligible) is ALWAYS active regardless of this flag.
+TRIAL_FINGERPRINT_ENFORCE = os.environ.get("TRIAL_FINGERPRINT_ENFORCE", "false").lower() == "true"
+
 # --- Founding Member badge (private launch) ---
 # The private invite list: accounts that sign up (or log in) with one of these
 # emails receive a PERMANENT Founding Member badge. Paste the invited emails
@@ -542,6 +550,8 @@ WINTER_ARC_TEST_EMAILS = {
     e.strip().lower() for e in os.environ.get("WINTER_ARC_TEST_EMAILS", "").split(",") if e.strip()
 }
 
+
+# --- Winter Update marketing broadcast (winter_update_email.py) -------------
 # A one-off re-engagement campaign to the whole eligible user base. OFF by
 # default: the real send is refused unless WINTER_UPDATE_ENABLED=true (and email
 # is configured). In test mode the send is restricted to WINTER_UPDATE_TEST_EMAILS
