@@ -347,6 +347,26 @@ def init_db() -> None:
                 created_at  TEXT DEFAULT CURRENT_TIMESTAMP
             )"""
         )
+        # The specific subscription that first claimed this card (audit trail for the
+        # one-trial-per-card guard). Additive; existing rows get NULL.
+        _add_column(c, "trial_fingerprints", "subscription", "TEXT")
+        # Historical safeguard (one-time, idempotent, FLAG-ONLY). Every account that
+        # ever subscribed is marked trial_used so it can NEVER be offered the 3-day
+        # trial — independent of the created_at launch cutoff. This touches ONLY the
+        # trial_used flag: no Stripe call, no plan change, no billing-date change, so
+        # existing/active subscriptions are left completely untouched. The WHERE
+        # clause makes it a no-op on every boot after the first.
+        try:
+            cur = c.execute(
+                "UPDATE users SET trial_used = 1 "
+                "WHERE trial_used = 0 "
+                "AND (subscribed_at IS NOT NULL OR stripe_subscription IS NOT NULL)"
+            )
+            if cur.rowcount:
+                print(f"[caloria] trial safeguard: marked {cur.rowcount} historical "
+                      f"subscriber(s) trial_used=1 (flag only; no billing change)")
+        except Exception as e:  # noqa: BLE001 — migration must never break boot
+            print(f"[caloria] trial safeguard backfill skipped: {e}")
         # --- Onboarding leads (pre-account assessment + email) ---
         # A prospect who finished the 7-step assessment and gave an email but has
         # not created an account or paid yet. Keyed by an unguessable id so results
