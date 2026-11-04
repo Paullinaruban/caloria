@@ -506,96 +506,180 @@ def _send_starter_expiry(user_id: int) -> None:
         print(f"[caloria] starter expiry email failed user={user_id}: {e}")
 
 
-def _customer_card_fingerprint(customer: str):
-    """Best-effort card fingerprint of the customer's default payment method. The
-    fingerprint is stable across Stripe customers for the same physical card, so it
-    lets us recognise the same person returning under a new email. Returns None when
-    it can't be determined (never raises)."""
+def _pm_fingerprint(pm):
+    """Card fingerprint from a payment-method object OR its id (fetches when given an
+    id). Returns None for non-card methods, wallets with no card fingerprint, or any
+    error (never raises)."""
+    try:
+        if isinstance(pm, str) and pm:
+            pm = _stripe(f"payment_methods/{pm}", method="GET")
+        if isinstance(pm, dict):
+            return (pm.get("card") or {}).get("fingerprint")
+    except BillingError:
+        return None
+    return None
+
+
+def _customer_default_card_fingerprint(customer: str):
+    """Fingerprint of the customer's CHOSEN DEFAULT card (invoice_settings
+    .default_payment_method) — NOT merely 'the first card on the account'. Used only
+    as a last-resort fallback; the subscription's own payment method is preferred.
+    None on failure (never raises)."""
     if not (customer and config.stripe_ready()):
         return None
     try:
         cust = _stripe(f"customers/{customer}",
                        {"expand[]": "invoice_settings.default_payment_method"},
                        method="GET")
-        pm = (cust.get("invoice_settings") or {}).get("default_payment_method")
-        if isinstance(pm, dict):
-            fp = (pm.get("card") or {}).get("fingerprint")
-            if fp:
-                return fp
+        return _pm_fingerprint((cust.get("invoice_settings") or {}).get("default_payment_method"))
+    except BillingError:
+        return None
+
+
+def _subscription_card_fingerprint(subscription_id: str, customer: str = None):
+    """Fingerprint of the card ACTUALLY attached to THIS subscription, so the guard
+    keys on the real payment method for the specific trial — never an unrelated card
+    that merely happens to be the first one on the Stripe customer. Resolution order:
+      1) the subscription's own default_payment_method,
+      2) the card that paid its latest invoice (payment_intent.payment_method),
+      3) last resort: the customer's chosen default card.
+    Returns None when nothing resolves — e.g. Apple Pay / Google Pay tokenized
+    wallets expose no stable card fingerprint (never raises)."""
+    if not (subscription_id and config.stripe_ready()):
+        return None
+    sub = {}
+    try:
+        sub = _stripe(f"subscriptions/{subscription_id}",
+                      {"expand[]": "default_payment_method"}, method="GET")
+        fp = _pm_fingerprint(sub.get("default_payment_method"))
+        if fp:
+            return fp
     except BillingError:
         pass
-    try:  # fallback: first card payment method attached to the customer
-        pms = _stripe("payment_methods",
-                      {"customer": customer, "type": "card"}, method="GET")
-        for pm in (pms.get("data") or []):
-            fp = (pm.get("card") or {}).get("fingerprint")
-            if fp:
-                return fp
+    try:
+        sub2 = _stripe(f"subscriptions/{subscription_id}",
+                       {"expand[]": "latest_invoice.payment_intent.payment_method"},
+                       method="GET")
+        pi = ((sub2.get("latest_invoice") or {}).get("payment_intent") or {})
+        fp = _pm_fingerprint(pi.get("payment_method"))
+        if fp:
+            return fp
     except BillingError:
         pass
-    return None
+    return _customer_default_card_fingerprint(customer or sub.get("customer"))
+
+
+def _user_id_for_customer(customer: str):
+    """Owning user id for a Stripe customer (for the fingerprint ledger audit column);
+    None if unknown. Never raises."""
+    if not customer:
+        return None
+    try:
+        with db.cursor() as c:
+            r = c.execute("SELECT id FROM users WHERE stripe_customer=?", (customer,)).fetchone()
+        return r["id"] if r else None
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _enforce_trial_fingerprint(customer: str, subscription_id: str) -> None:
-    """Cross-account trial guard. If this trialing subscription's card already
-    consumed a trial on a DIFFERENT customer, end the trial now so Stripe charges
-    immediately (no second free trial). Otherwise record the fingerprint. Fail-open:
-    any error leaves the trial intact, so a genuine customer is never blocked."""
+    """One 3-day trial per PHYSICAL CARD, across accounts/emails, race-safe.
+
+    The fingerprint comes from the ACTUAL payment method on THIS trialing
+    subscription (see _subscription_card_fingerprint), not merely the first card on
+    the customer. Claiming the card is a single ATOMIC `INSERT OR IGNORE` on the
+    fingerprint PRIMARY KEY: under two simultaneous trial attempts with the same
+    card, exactly one INSERT wins (keeps its trial) and every other loses and is
+    treated as reuse — they can never both receive a free trial.
+
+    FAIL-OPEN everywhere: if no card fingerprint can be read (incl. Apple Pay /
+    Google Pay tokenized cards) or any lookup fails, take NO action — never cancel a
+    subscription, never block a paid checkout.
+
+    On confirmed reuse (card already owned by a DIFFERENT customer): LOG-ONLY mode
+    (default) only logs; ENFORCE mode re-verifies the NEW subscription is still
+    `trialing`, then DELETEs ONLY that subscription (no invoice, no charge) and marks
+    ONLY the new account free. The original owner's subscription is never read or
+    modified, so existing subscriptions and their billing dates are untouched."""
     if not subscription_id:
         return
-    fp = _customer_card_fingerprint(customer)
+    fp = _subscription_card_fingerprint(subscription_id, customer)
     if not fp:
+        # No stable card fingerprint (e.g. Apple Pay / Google Pay wallet, or lookup
+        # failure) → this cannot be a per-card decision. Do nothing: never cancel,
+        # never block, never charge.
+        print(f"[caloria] trial: no card fingerprint for sub {subscription_id} "
+              f"(customer {customer}) — fingerprint guard skipped (fail-open)")
         return
+
+    # ---- Atomic claim. The fingerprint PRIMARY KEY makes this race-safe across
+    # concurrent webhooks/workers: the first INSERT wins, all others are IGNOREd. ----
+    owner_user_id = _user_id_for_customer(customer)   # resolved BEFORE the cursor (lock) block
     try:
         with db.cursor() as c:
-            row = c.execute(
+            c.execute(
+                "INSERT OR IGNORE INTO trial_fingerprints (fingerprint, customer, subscription, user_id) "
+                "VALUES (?, ?, ?, ?)",
+                (fp, customer, subscription_id, owner_user_id),
+            )
+            claimed = (c.rowcount == 1)
+            owner = None if claimed else c.execute(
                 "SELECT customer FROM trial_fingerprints WHERE fingerprint=?", (fp,)
             ).fetchone()
+    except Exception as e:  # noqa: BLE001 — never break the webhook
+        print(f"[caloria] trial: fingerprint claim failed (fail-open): {e}")
+        return
+
+    if claimed:
+        # First trial ever seen for this physical card → legitimate; keep it.
+        print(f"[caloria] trial: card {fp[:8]}… first trial recorded for customer {customer}")
+        return
+
+    owner_customer = owner["customer"] if owner else None
+    if not owner_customer or owner_customer == customer:
+        # Same customer (duplicate webhook / same account) → no action.
+        return
+
+    # ---- Confirmed cross-account reuse of the same physical card ----
+    if not config.TRIAL_FINGERPRINT_ENFORCE:
+        # LOG-ONLY (default): detect + log, take NO action.
+        print(f"[caloria] trial: LOG-ONLY fingerprint reuse ({fp[:8]}…) — WOULD cancel "
+              f"trial for sub {subscription_id} (customer {customer}); no action taken "
+              f"(set TRIAL_FINGERPRINT_ENFORCE=true to enforce)")
+        _log_event("trial.fingerprint_reuse_logonly", customer, "detected_no_action")
+        return
+
+    # ENFORCE: re-verify THIS subscription is STILL trialing before cancelling, so a
+    # converted/active subscription — and its billing date — can never be touched.
+    try:
+        live = _stripe(f"subscriptions/{subscription_id}", method="GET")
+    except BillingError as e:
+        print(f"[caloria] trial: could not re-verify sub {subscription_id} — not cancelling ({e})")
+        return
+    if (live.get("status") or "").lower() != "trialing":
+        print(f"[caloria] trial: sub {subscription_id} is {live.get('status')} (not trialing) "
+              f"— not cancelling (billing untouched)")
+        return
+
+    # Cancel ONLY this duplicate trial, with NO invoice/charge.
+    try:
+        _stripe(f"subscriptions/{subscription_id}", method="DELETE",
+                idempotency_key=f"trialblock_{subscription_id}")
+        print(f"[caloria] trial: fingerprint reuse ({fp[:8]}…) — canceled duplicate trial "
+              f"(no charge) for sub {subscription_id}")
+        _log_event("trial.fingerprint_reuse", customer, "trial_blocked_no_charge")
+    except BillingError as e:
+        print(f"[caloria] trial: could not cancel reused trial {subscription_id}: {e}")
+        return
+    # Mark ONLY the new (duplicate) account free. The subscription.deleted webhook
+    # this DELETE emits converges the cached plan regardless of event ordering.
+    try:
+        with db.cursor() as c:
+            c.execute("UPDATE users SET trial_used=1, plan='free', "
+                      "subscription_status='canceled' WHERE stripe_customer=?",
+                      (customer,))
     except Exception as e:  # noqa: BLE001
-        print(f"[caloria] trial: fingerprint lookup failed: {e}")
-        return
-    prior_customer = row["customer"] if row else None
-    if prior_customer and prior_customer != customer:
-        if not config.TRIAL_FINGERPRINT_ENFORCE:
-            # LOG-ONLY (default): detect + log the reuse, but take NO action — no
-            # cancel, no charge, no account/plan change. Lets the guard be observed
-            # against real traffic before it ever touches a subscription.
-            print(f"[caloria] trial: LOG-ONLY fingerprint reuse ({fp[:8]}…) — WOULD "
-                  f"cancel trial for sub {subscription_id} (customer {customer}); "
-                  f"no action taken (set TRIAL_FINGERPRINT_ENFORCE=true to enforce)")
-            _log_event("trial.fingerprint_reuse_logonly", customer, "detected_no_action")
-            return
-        # ENFORCE mode. Do NOT charge. Cancel the trialing subscription with no invoice, mark the
-        # account's trial as used, and let it fall to free. The frontend then sees
-        # trial_eligible=false and tells the user the trial is unavailable — they
-        # must explicitly subscribe at the regular price, which only then charges
-        # (on their click). The subscription.deleted webhook this cancel emits
-        # converges the cached plan to free regardless of webhook ordering.
-        try:
-            _stripe(f"subscriptions/{subscription_id}", method="DELETE",
-                    idempotency_key=f"trialblock_{subscription_id}")
-            print(f"[caloria] trial: fingerprint reuse ({fp[:8]}…) — canceled trial "
-                  f"(no charge) for sub {subscription_id}")
-            _log_event("trial.fingerprint_reuse", customer, "trial_blocked_no_charge")
-        except BillingError as e:
-            print(f"[caloria] trial: could not cancel reused trial {subscription_id}: {e}")
-        try:
-            with db.cursor() as c:
-                c.execute("UPDATE users SET trial_used=1, plan='free', "
-                          "subscription_status='canceled' WHERE stripe_customer=?",
-                          (customer,))
-        except Exception as e:  # noqa: BLE001
-            print(f"[caloria] trial: could not mark trial_used after block: {e}")
-        return
-    if not prior_customer:
-        try:
-            with db.cursor() as c:
-                c.execute(
-                    "INSERT OR IGNORE INTO trial_fingerprints (fingerprint, customer) "
-                    "VALUES (?, ?)", (fp, customer),
-                )
-        except Exception as e:  # noqa: BLE001
-            print(f"[caloria] trial: could not record fingerprint: {e}")
+        print(f"[caloria] trial: could not mark trial_used after block: {e}")
 
 
 def handle_event(event: dict) -> None:

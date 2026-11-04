@@ -467,18 +467,39 @@ def starter_eligible(row) -> bool:
             and not _row_get(row, "stripe_subscription"))
 
 
+def _created_after_trial_launch(row) -> bool:
+    """True only if this account was created on/after the trial launch cutoff.
+    Pre-launch accounts (incl. those that registered earlier but never subscribed)
+    are NEVER offered the trial. Robust to the two timestamp formats stored:
+    created_at uses SQLite CURRENT_TIMESTAMP ('YYYY-MM-DD HH:MM:SS'); the cutoff
+    may be a date or datetime. Compared lexicographically on the fixed-width
+    normalized form (safe because both are zero-padded, big-endian)."""
+    import config
+    cutoff = (getattr(config, "TRIAL_LAUNCH_AT", "") or "").strip()
+    if not cutoff:
+        return True  # date gate disabled by config
+    created = _row_get(row, "created_at")
+    if not created:
+        return False  # unknown creation time → treat as pre-launch (no trial)
+    def _norm(s):
+        return str(s).replace("T", " ").replace("Z", "").strip()[:19]
+    return _norm(created) >= _norm(cutoff)
+
+
 def trial_eligible(row) -> bool:
-    """The 3-day free trial is a ONE-TIME offer for genuinely new, never-subscribed
-    accounts. Anyone who has already used a trial, ever subscribed, or has a Stripe
-    subscription on record is charged immediately with NO trial. Mirrors
-    starter_eligible. (Account-level guarantee; the card-fingerprint check in
-    billing handles the same person returning under a different email.)"""
+    """The 3-day free trial is a ONE-TIME offer for genuinely NEW, never-subscribed
+    accounts created after the trial launch. Anyone who registered before launch,
+    has already used a trial, ever subscribed, or has a Stripe subscription on
+    record is charged immediately with NO trial. Mirrors starter_eligible.
+    (Account-level guarantee; the card-fingerprint check in billing handles the
+    same person returning under a different email.)"""
     import config
     if config.TRIAL_DAYS <= 0:
         return False
     return (not _row_get(row, "trial_used")
             and not _row_get(row, "subscribed_at")
-            and not _row_get(row, "stripe_subscription"))
+            and not _row_get(row, "stripe_subscription")
+            and _created_after_trial_launch(row))
 
 
 def grant_founding_if_invited(user_id: int, email: str) -> bool:

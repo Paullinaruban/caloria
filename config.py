@@ -432,6 +432,14 @@ TRIAL_DAYS = int(os.environ.get("TRIAL_DAYS", "0"))
 # guard (trial_eligible) is ALWAYS active regardless of this flag.
 TRIAL_FINGERPRINT_ENFORCE = os.environ.get("TRIAL_FINGERPRINT_ENFORCE", "false").lower() == "true"
 
+# Trial launch cutoff. ONLY accounts created on/after this UTC timestamp can ever
+# be offered the 3-day trial. Every pre-existing account — including users who
+# registered earlier but NEVER subscribed — is charged immediately with NO trial
+# (owner rule: only genuinely new, post-launch accounts receive the free trial).
+# Accepts "YYYY-MM-DD" or "YYYY-MM-DD HH:MM:SS". Override per deploy if the exact
+# launch moment differs. Empty string disables the date gate (not recommended).
+TRIAL_LAUNCH_AT = os.environ.get("TRIAL_LAUNCH_AT", "2026-11-03").strip()
+
 # --- Founding Member badge (private launch) ---
 # The private invite list: accounts that sign up (or log in) with one of these
 # emails receive a PERMANENT Founding Member badge. Paste the invited emails
