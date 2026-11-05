@@ -335,14 +335,76 @@ def verify_and_parse(payload: bytes, sig_header: str) -> dict:
     return json.loads(payload.decode())
 
 
+# Billing-portal configuration pinned IN CODE so a cancellation always takes
+# effect at the END of the current period (the trial end while trialing, or the
+# paid-period end once charged) and NEVER immediately — independent of whatever
+# the Stripe Dashboard's default portal is set to. `proration_behavior=none`
+# means an already-successful payment is never prorated or refunded; the user
+# simply keeps access until the period they paid for runs out. Created once, then
+# its id is cached in `kv` (and in-process) so we don't recreate it per request.
+_PORTAL_CFG_KV = "stripe_portal_cfg_at_period_end_v1"
+_portal_cfg_cache = None
+
+
+def _portal_configuration_id():
+    """Return (creating+caching if needed) the id of our at-period-end portal
+    configuration. Raises BillingError if Stripe can't create it."""
+    global _portal_cfg_cache
+    if _portal_cfg_cache:
+        return _portal_cfg_cache
+    cached = db.kv_get(_PORTAL_CFG_KV)
+    if cached:
+        _portal_cfg_cache = cached
+        return cached
+    params = {
+        "business_profile[headline]": "Manage your Caloria Club membership",
+        # Cancellations are SCHEDULED, not immediate, and never refunded/prorated.
+        "features[subscription_cancel][enabled]": "true",
+        "features[subscription_cancel][mode]": "at_period_end",
+        "features[subscription_cancel][proration_behavior]": "none",
+        # Keep the normal self-serve tools the account page already links to.
+        "features[invoice_history][enabled]": "true",
+        "features[payment_method_update][enabled]": "true",
+        "features[customer_update][enabled]": "true",
+        "features[customer_update][allowed_updates][]": "email",
+        "metadata[managed_by]": "caloria",
+        "metadata[cancel_mode]": "at_period_end",
+    }
+    base = (getattr(config, "APP_BASE_URL", "") or "").rstrip("/")
+    if base:
+        params["business_profile[privacy_policy_url]"] = f"{base}/privacy.html"
+        params["business_profile[terms_of_service_url]"] = f"{base}/terms.html"
+    cfg = _stripe("billing_portal/configurations", params, method="POST",
+                  idempotency_key="portal_cfg_at_period_end_v1")
+    cid = cfg.get("id")
+    if cid:
+        db.kv_set(_PORTAL_CFG_KV, cid)
+        _portal_cfg_cache = cid
+    return cid
+
+
 def create_portal(user) -> str:
-    """Self-serve billing portal: cancel, update card, view invoices."""
+    """Self-serve billing portal: cancel, update card, view invoices.
+
+    Pins our at-period-end configuration so cancelling in the portal schedules
+    cancel_at_period_end (access continues until the period/trial ends) rather
+    than cancelling immediately. Fail-safe: if the configuration can't be
+    resolved, the portal still opens (card updates / invoices stay available)
+    and we log loudly rather than block the account page."""
     if not user["stripe_customer"]:
         raise BillingError("No billing account on file.")
-    session = _stripe("billing_portal/sessions", {
+    params = {
         "customer": user["stripe_customer"],
         "return_url": f"{config.APP_BASE_URL}/?billing=done",
-    })
+    }
+    try:
+        cfg = _portal_configuration_id()
+        if cfg:
+            params["configuration"] = cfg
+    except BillingError as e:
+        print(f"[caloria] portal: could not pin at-period-end configuration ({e}); "
+              "opening default portal")
+    session = _stripe("billing_portal/sessions", params)
     return session["url"]
 
 
