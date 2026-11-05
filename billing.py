@@ -202,6 +202,11 @@ def create_checkout(user, interval: str, return_base: str = "") -> str:
     print(f"[caloria] checkout: mode={_key_mode()} interval={interval} price={price_id} return={base}")
     params = {
         "mode": "subscription",
+        # Require a card to START the subscription/trial. This is Stripe's default
+        # for subscription mode, but we set it EXPLICITLY so the trial can never be
+        # created without a payment method (a trial with no PM is what Stripe's
+        # account-level "cancel at trial end if no payment method" rule acts on).
+        "payment_method_collection": "always",
         "line_items[0][price]": price_id,
         "line_items[0][quantity]": 1,
         "client_reference_id": str(user["id"]),
@@ -239,6 +244,13 @@ def create_checkout(user, interval: str, return_base: str = "") -> str:
     grant_trial = config.TRIAL_DAYS > 0 and auth.trial_eligible(user)
     if grant_trial:
         params["subscription_data[trial_period_days]"] = config.TRIAL_DAYS
+        # CRITICAL: pin what happens when the trial ends. Without this, Stripe uses
+        # the ACCOUNT's default trial-end behavior — and if that default is "cancel
+        # the subscription" (a Dashboard setting), EVERY trial gets scheduled to
+        # cancel at trial end with no upcoming invoice instead of converting to a
+        # paid month. `create_invoice` forces Stripe to invoice + charge the saved
+        # card when the 3 days end, so the trial converts to $19.99/mo and renews.
+        params["subscription_data[trial_settings][end_behavior][missing_payment_method]"] = "create_invoice"
         # Stamp both the session and the subscription so the webhook can record
         # trial_used reliably regardless of event ordering.
         params["metadata[trial_granted]"] = "1"
@@ -377,34 +389,37 @@ def _portal_configuration_id():
     cfg = _stripe("billing_portal/configurations", params, method="POST",
                   idempotency_key="portal_cfg_at_period_end_v1")
     cid = cfg.get("id")
-    if cid:
-        db.kv_set(_PORTAL_CFG_KV, cid)
-        _portal_cfg_cache = cid
+    if not cid:
+        # A create that returns no id must NOT be treated as success — otherwise
+        # the caller could open an unpinned portal. Fail closed.
+        raise BillingError("Could not create the billing portal configuration.")
+    db.kv_set(_PORTAL_CFG_KV, cid)
+    _portal_cfg_cache = cid
     return cid
 
 
 def create_portal(user) -> str:
     """Self-serve billing portal: cancel, update card, view invoices.
 
-    Pins our at-period-end configuration so cancelling in the portal schedules
-    cancel_at_period_end (access continues until the period/trial ends) rather
-    than cancelling immediately. Fail-safe: if the configuration can't be
-    resolved, the portal still opens (card updates / invoices stay available)
-    and we log loudly rather than block the account page."""
+    FAIL CLOSED: the session is ALWAYS pinned to our at-period-end configuration
+    so a cancellation schedules cancel_at_period_end (access continues until the
+    period/trial ends) and can never take effect immediately. If that
+    configuration cannot be retrieved or created, we raise instead of opening an
+    un-pinned portal (which could inherit a Dashboard default that cancels
+    immediately). The account page surfaces this as a normal 'temporarily
+    unavailable' message via the 503 handler."""
     if not user["stripe_customer"]:
         raise BillingError("No billing account on file.")
-    params = {
+    # Propagates BillingError if Stripe can't build/return our configuration —
+    # that is the intended fail-closed behavior, do NOT swallow it.
+    cfg = _portal_configuration_id()
+    if not cfg:
+        raise BillingError("Billing portal is temporarily unavailable. Please try again.")
+    session = _stripe("billing_portal/sessions", {
         "customer": user["stripe_customer"],
         "return_url": f"{config.APP_BASE_URL}/?billing=done",
-    }
-    try:
-        cfg = _portal_configuration_id()
-        if cfg:
-            params["configuration"] = cfg
-    except BillingError as e:
-        print(f"[caloria] portal: could not pin at-period-end configuration ({e}); "
-              "opening default portal")
-    session = _stripe("billing_portal/sessions", params)
+        "configuration": cfg,
+    })
     return session["url"]
 
 
