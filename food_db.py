@@ -147,6 +147,13 @@ TEMPLATES = [
        420, 38, 30, 14, 8, [("Cod fillet", 160), ("Mixed vegetables", 180), ("Olive oil", 10), ("Lemon", 20)],
        ["Bake cod with lemon.", "Roast vegetables alongside and plate."],
        {"gluten_free", "dairy_free", "high_protein"}, {"fish"}),
+    _t("Lunch", "Chicken Soup", "Nourishing chicken & rice-noodle soup with carrot, broccoli and egg.",
+       419, 41, 44, 9, 4, [("Chicken breast", 130), ("Broccoli", 80), ("Carrot", 50), ("Rice noodles", 40), ("Egg", 50), ("Salt", 1)],
+       ["Bring a pot of water to a gentle boil and season with a little salt.",
+        "Add the diced chicken and carrot; simmer 10-12 min, until the chicken is cooked through.",
+        "Add the broccoli and rice noodles; cook 3-4 min more, until the noodles are just tender.",
+        "Add the egg - stir it through the broth, or top with a halved soft-boiled egg - then season with salt to taste and serve hot."],
+       {"high_protein", "gluten_free", "dairy_free"}, {"egg"}),
 
     # ==================== SNACK ====================
     _t("Snack", "Vanilla Protein Shake", "Quick high-protein shake to bridge meals.",
@@ -271,6 +278,13 @@ TEMPLATES = [
         "Stir the Greek yogurt, Parmesan, minced garlic and reserved pasta water into a smooth sauce.",
         "Lower the heat and fold the pasta and sauce through the chicken and broccoli until coated - don't let it boil - then serve."],
        {"high_protein"}, {"gluten", "dairy"}),
+    _t("Dinner", "Chicken Soup", "Nourishing chicken & rice-noodle soup with carrot, broccoli and egg.",
+       419, 41, 44, 9, 4, [("Chicken breast", 130), ("Broccoli", 80), ("Carrot", 50), ("Rice noodles", 40), ("Egg", 50), ("Salt", 1)],
+       ["Bring a pot of water to a gentle boil and season with a little salt.",
+        "Add the diced chicken and carrot; simmer 10-12 min, until the chicken is cooked through.",
+        "Add the broccoli and rice noodles; cook 3-4 min more, until the noodles are just tender.",
+        "Add the egg - stir it through the broth, or top with a halved soft-boiled egg - then season with salt to taste and serve hot."],
+       {"high_protein", "gluten_free", "dairy_free"}, {"egg"}),
 ]
 
 
