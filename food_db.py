@@ -87,6 +87,13 @@ TEMPLATES = [
        ["Stir chia into coconut milk with maple syrup.", "Chill overnight, top with berries."],
        {"vegan", "gluten_free", "dairy_free"}, set()),
 
+    _t("Breakfast", "Apple Crumble Yogurt Bowl", "Cinnamon-stewed apples over creamy Greek yogurt with crunchy granola.",
+       271, 19, 41, 3, 6, [("Apple", 150), ("Greek yogurt", 170), ("Granola", 20), ("Ground cinnamon", 1)],
+       ["Dice the apple and simmer with the cinnamon and a splash of water over medium-low heat 5-7 min, until soft and lightly caramelised.",
+        "Spoon the Greek yogurt into a bowl (stir in a little vanilla if you like).",
+        "Top with the warm cinnamon apples, then the granola.",
+        "Finish with a pinch of cinnamon and serve."],
+       {"vegetarian", "high_protein"}, {"dairy", "gluten"}),
     # ==================== LUNCH ====================
     _t("Lunch", "Grilled Chicken & Quinoa Bowl", "Lean chicken, fluffy quinoa & roasted veg.",
        480, 42, 45, 14, 8, [("Chicken breast", 150), ("Quinoa", 70), ("Roasted veg", 120), ("Olive oil", 10)],
@@ -256,6 +263,14 @@ TEMPLATES = [
        430, 18, 56, 14, 14, [("Eggplant", 180), ("Chickpeas", 120), ("Tomato", 100), ("Olive oil", 12)],
        ["Layer eggplant, chickpeas and tomato.", "Bake at 190°C for 30 min."],
        {"vegan", "gluten_free", "dairy_free"}, set()),
+    _t("Dinner", "Creamy Chicken & Broccoli Pasta", "High-protein chicken & broccoli pasta in a light Greek-yogurt Parmesan sauce.",
+       451, 45, 43, 12, 6, [("Whole-wheat pasta", 45), ("Chicken breast", 115), ("Broccoli", 100), ("Greek yogurt", 60), ("Parmesan", 10), ("Olive oil", 5), ("Garlic", 3)],
+       ["Cook the pasta until al dente; reserve 1 tbsp of the pasta water before draining.",
+        "Season the diced chicken with salt, pepper and garlic powder, then pan-fry in the olive oil over medium heat until golden and cooked through.",
+        "Add the broccoli and cook 3-4 min, until just tender.",
+        "Stir the Greek yogurt, Parmesan, minced garlic and reserved pasta water into a smooth sauce.",
+        "Lower the heat and fold the pasta and sauce through the chicken and broccoli until coated - don't let it boil - then serve."],
+       {"high_protein"}, {"gluten", "dairy"}),
 ]
 
 
