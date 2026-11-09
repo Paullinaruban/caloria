@@ -50,7 +50,26 @@ def verify(token: str, remote_ip: str | None = None) -> bool:
             urllib.request.Request(_VERIFY_URL, data=data, method="POST"), timeout=10
         ) as resp:
             body = json.loads(resp.read().decode("utf-8"))
-        return bool(body.get("success"))
-    except (urllib.error.URLError, OSError, json.JSONDecodeError):
+        ok = bool(body.get("success"))
+        if not ok:
+            # DIAGNOSTIC ONLY — no behavior change (same bool returned). Surfaces
+            # Cloudflare's reason in the Render logs so we can see WHY a token was
+            # rejected. Common error-codes:
+            #   invalid-input-secret   → secret wrong / for a different widget
+            #   invalid-input-response → token invalid, or site-key & secret are from
+            #                            different widgets, or the token has expired
+            #   timeout-or-duplicate   → token already used, or older than ~300s
+            #   missing-input-response → no token reached the backend
+            # `hostname` is the domain Cloudflare recorded the token was solved on
+            # (compare it to caloriaclub.com to catch a hostname restriction).
+            print(f"[caloria] turnstile verify FAILED: error-codes="
+                  f"{body.get('error-codes')} hostname={body.get('hostname')} "
+                  f"challenge_ts={body.get('challenge_ts')}")
+        return ok
+    except (urllib.error.URLError, OSError, json.JSONDecodeError) as e:
         # Fail-closed: if we can't verify, reject (don't let bots through on outage).
+        # Logged (no behavior change) so an outage/egress block to Cloudflare — which
+        # ALSO surfaces to users as "Bot check failed" — is distinguishable from a
+        # real token rejection above.
+        print(f"[caloria] turnstile verify ERROR (failing closed, could not reach Cloudflare): {e}")
         return False
