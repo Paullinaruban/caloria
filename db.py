@@ -350,6 +350,16 @@ def init_db() -> None:
         # The specific subscription that first claimed this card (audit trail for the
         # one-trial-per-card guard). Additive; existing rows get NULL.
         _add_column(c, "trial_fingerprints", "subscription", "TEXT")
+        # Webhook de-duplication ledger. Stripe can deliver the SAME event id more
+        # than once (retries, at-least-once delivery); billing.handle_event claims
+        # the id here so each event's side effects run at most once. The PRIMARY KEY
+        # makes the claim atomic/race-safe across concurrent deliveries.
+        c.execute(
+            """CREATE TABLE IF NOT EXISTS processed_webhook_events (
+                event_id   TEXT PRIMARY KEY,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )"""
+        )
         # Historical safeguard (one-time, idempotent, FLAG-ONLY). Every account that
         # ever subscribed is marked trial_used so it can NEVER be offered the 3-day
         # trial — independent of the created_at launch cutoff. This touches ONLY the

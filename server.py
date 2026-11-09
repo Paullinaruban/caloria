@@ -1638,6 +1638,15 @@ class Handler(BaseHTTPRequestHandler):
         if not self._require_verified(u):
             return
         interval = data.get("interval", "monthly")
+        # Double-charge guard: a customer who already holds a LIVE active/trialing
+        # subscription must not be able to start a second checkout (confused click,
+        # second tab, direct API call) and be billed twice / get a duplicate sub.
+        # Canceled / lapsed customers are allowed through to re-subscribe.
+        if billing.has_live_active_subscription(u):
+            return self._send(409, {
+                "error": "You already have an active Caloria membership.",
+                "already_subscribed": True,
+            })
         # Starter is a one-time ENTRY offer — enforce eligibility on the server so
         # an existing/returning user can't buy it via a direct API call.
         if interval == "starter" and not auth.starter_eligible(u):
@@ -1645,8 +1654,17 @@ class Handler(BaseHTTPRequestHandler):
         # No currency handling here — Stripe Adaptive Pricing presents each
         # customer their local currency at checkout from the single base price.
         try:
-            url = billing.create_checkout(auth.public_user(u), interval,
-                                          return_base=self.headers.get("Origin", ""))
+            # Pass the AUTHORITATIVE full user row `u` (it carries created_at /
+            # trial_used / subscribed_at / stripe_subscription) and the eligibility
+            # decision computed on it. This is what guarantees a genuinely new user
+            # receives the 3-day trial and a returning user is charged immediately —
+            # never the reverse. (Previously public_user(u), a trimmed dict, was
+            # passed, which made create_checkout mis-judge everyone ineligible.)
+            url = billing.create_checkout(
+                u, interval,
+                return_base=self.headers.get("Origin", ""),
+                trial_eligible=auth.trial_eligible(u),
+            )
         except billing.BillingError as e:
             return self._send(503, {"error": str(e)})
         try:  # additive: arms the abandoned-checkout email (Email B) for this user

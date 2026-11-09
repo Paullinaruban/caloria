@@ -155,7 +155,7 @@ def clear_pending_checkout(user_id) -> None:
         print(f"[caloria] clear pending checkout failed for {user_id}: {e}")
 
 
-def create_checkout(user, interval: str, return_base: str = "") -> str:
+def create_checkout(user, interval: str, return_base: str = "", *, trial_eligible=None) -> str:
     if interval not in ("monthly", "yearly", "starter"):
         raise BillingError("Invalid plan interval.")
 
@@ -241,7 +241,16 @@ def create_checkout(user, interval: str, return_base: str = "") -> str:
     # fingerprint guard in handle_event. trial_period_days is a count of DAYS, so
     # the annual plan gets 3 free days, not 3 free months.
     import auth
-    grant_trial = config.TRIAL_DAYS > 0 and auth.trial_eligible(user)
+    # Eligibility is decided ONCE, on the AUTHORITATIVE DB row, by the caller and
+    # passed in via `trial_eligible`. We must NOT recompute it here on whatever
+    # object we happen to receive: the public_user() dict omits created_at /
+    # trial_used / subscribed_at / stripe_subscription, so recomputing on it made
+    # EVERY brand-new, genuinely-eligible user look ineligible (created_at missing
+    # → _created_after_trial_launch False) → no trial_period_days → an immediate
+    # $19.99 charge instead of 3 free days. The explicit argument removes that
+    # whole class of bug. Fallback recompute only if a caller omits it.
+    eligible = auth.trial_eligible(user) if trial_eligible is None else bool(trial_eligible)
+    grant_trial = config.TRIAL_DAYS > 0 and eligible
     if grant_trial:
         params["subscription_data[trial_period_days]"] = config.TRIAL_DAYS
         # CRITICAL: pin what happens when the trial ends. Without this, Stripe uses
@@ -302,25 +311,33 @@ def confirm_checkout(user, session_id: str) -> bool:
     # trial we canceled for card-reuse (see _enforce_trial_fingerprint) must not be
     # re-activated by this redirect path — only active/trialing subscriptions grant.
     sub_id = s.get("subscription")
+    live_status = None
     if sub_id and config.stripe_ready():
         try:
             sub = _stripe(f"subscriptions/{sub_id}", method="GET")
-            if (sub.get("status") or "").lower() not in _ACTIVE_STATUSES:
+            live_status = (sub.get("status") or "").lower()
+            if live_status not in _ACTIVE_STATUSES:
                 print(f"[caloria] confirm_checkout: subscription {sub_id} is "
                       f"{sub.get('status')} — not activating")
                 return False
         except BillingError:
             pass  # transient lookup failure → fall back to session-based activation
     interval = (s.get("metadata") or {}).get("plan_interval")
+    # Keep the record honest so frontend/DB/Stripe agree: a Starter checkout must
+    # not be stored as Premium (Starter excludes AI), and a trialing account must
+    # not be shown as a charged 'active' one — mirror the live subscription status
+    # when we have it (trialing/active/past_due), else assume active.
+    plan = "starter" if interval == "starter" else "premium"
+    status = live_status or "active"
     now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     with db.cursor() as c:
         c.execute(
-            "UPDATE users SET plan='premium', subscription_status='active', "
+            "UPDATE users SET plan=?, subscription_status=?, "
             "stripe_customer=COALESCE(?, stripe_customer), "
             "stripe_subscription=COALESCE(?, stripe_subscription), "
             "plan_interval=COALESCE(?, plan_interval), "
             "subscribed_at=COALESCE(subscribed_at, ?) WHERE id=?",
-            (s.get("customer"), s.get("subscription"), interval, now, user["id"]),
+            (plan, status, s.get("customer"), s.get("subscription"), interval, now, user["id"]),
         )
     clear_pending_checkout(user["id"])
     _log_event("checkout.confirmed", s.get("customer"), "active", user_id=user["id"])
@@ -502,6 +519,25 @@ def live_subscription_active(user):
     return (s.get("status") or "").lower() in _ACTIVE_STATUSES
 
 
+def has_live_active_subscription(user) -> bool:
+    """True only if this account currently holds a LIVE active/trialing Stripe
+    subscription. Used to block a SECOND checkout so a confused user / double tab
+    can't create a duplicate subscription and be charged twice.
+
+    Conservative on purpose: it blocks only when the cached state says active/
+    trialing AND Stripe does not explicitly say the sub is inactive. A canceled or
+    past-due-then-ended customer (Stripe returns not-active, or False) is allowed to
+    re-subscribe. If Stripe can't be reached (None) while the flag says active, we
+    block — refunding a double charge is worse than asking the user to use the
+    billing portal. A stale 'active' flag with NO subscription id never blocks."""
+    status = str(_row(user, "subscription_status", "") or "").lower()
+    if not (_row(user, "stripe_subscription") and status in ("active", "trialing")):
+        return False
+    # live check: True (active) or None (unknown) → block; False (Stripe says not
+    # active) → allow re-subscribe.
+    return live_subscription_active(user) is not False
+
+
 def reconcile_entitlement(user) -> bool:
     """Self-heal a stale 'free'/non-entitled row for a customer whose Stripe
     subscription is in fact still active (e.g. a missed or out-of-order webhook).
@@ -551,6 +587,61 @@ def _is_starter_customer(customer) -> bool:
     with db.cursor() as c:
         r = c.execute("SELECT plan FROM users WHERE stripe_customer=?", (customer,)).fetchone()
     return bool(r and (r["plan"] or "") == "starter")
+
+
+def _event_tier(obj) -> str:
+    """The tier a subscription/session event carries on its OWN immutable metadata
+    (stamped at checkout). '' when absent (legacy objects created before the stamp)."""
+    return ((obj.get("metadata") or {}).get("tier") or "").strip().lower()
+
+
+def _claim_webhook_event(event_id: str) -> bool:
+    """Record a Stripe event id so the SAME delivery is processed at most once.
+    Returns True if this is the first time we've seen it (caller should process),
+    False if it was already handled (caller should skip). Fail-OPEN: on any DB
+    error, returns True so a delivery is never silently dropped."""
+    if not event_id:
+        return True
+    try:
+        with db.cursor() as c:
+            return c.execute(
+                "INSERT OR IGNORE INTO processed_webhook_events (event_id) VALUES (?)",
+                (event_id,),
+            ).rowcount == 1
+    except Exception as e:  # noqa: BLE001 — never let bookkeeping break a webhook
+        print(f"[caloria] webhook dedup claim failed (fail-open): {e}")
+        return True
+
+
+def _release_webhook_event(event_id: str) -> None:
+    """Undo a claim so Stripe's automatic retry can re-process the event after a
+    handler error (we only want to dedup SUCCESSFUL processing)."""
+    if not event_id:
+        return
+    try:
+        with db.cursor() as c:
+            c.execute("DELETE FROM processed_webhook_events WHERE event_id=?", (event_id,))
+    except Exception as e:  # noqa: BLE001
+        print(f"[caloria] webhook dedup release failed: {e}")
+
+
+def _subscription_is_current(customer: str, sub_id: str) -> bool:
+    """True if `sub_id` is the subscription currently on this customer's row (or the
+    row has none recorded yet). Used to ignore an out-of-order / late event for an
+    OLD subscription that would otherwise clobber a NEWER active one. Never raises;
+    fails OPEN (True) so a normal single-subscription customer is unaffected."""
+    if not (customer and sub_id):
+        return True
+    try:
+        with db.cursor() as c:
+            r = c.execute(
+                "SELECT stripe_subscription FROM users WHERE stripe_customer=?", (customer,)
+            ).fetchone()
+    except Exception as e:  # noqa: BLE001
+        print(f"[caloria] current-subscription check failed (fail-open): {e}")
+        return True
+    current = (r["stripe_subscription"] if r else None) or ""
+    return (not current) or (current == sub_id)
 
 
 def _send_starter_expiry_by_customer(customer) -> None:
@@ -762,7 +853,26 @@ def _enforce_trial_fingerprint(customer: str, subscription_id: str) -> None:
 def handle_event(event: dict) -> None:
     etype = event.get("type")
     obj = event.get("data", {}).get("object", {})
-    _log_event(etype, obj.get("customer"), obj.get("status"),
+
+    # ---- Duplicate-delivery guard. Stripe retries and can deliver the SAME event
+    # more than once; we process each event id at most once so side effects never
+    # run twice (e.g. a second billing_events row, a re-issued cancellation). The
+    # claim is RELEASED on a handler error below, so a genuinely failed event is
+    # still retried by Stripe. Fail-open if the event carries no id.
+    eid = event.get("id")
+    if eid and not _claim_webhook_event(eid):
+        print(f"[caloria] webhook: duplicate event {eid} ({etype}) — ignored")
+        return
+    try:
+        _dispatch_event(etype, obj)
+    except Exception:
+        _release_webhook_event(eid)   # allow Stripe's automatic retry
+        raise
+
+
+def _dispatch_event(etype: str, obj: dict) -> None:
+    customer = obj.get("customer")
+    _log_event(etype, customer, obj.get("status"),
                user_id=int(obj["client_reference_id"]) if obj.get("client_reference_id") else None)
 
     if etype == "checkout.session.completed":
@@ -807,7 +917,6 @@ def handle_event(event: dict) -> None:
         # a card that already consumed a trial (on ANY customer) has its trial ended
         # now so Stripe charges immediately. Also stamp trial_used on the owning
         # account as a backup to checkout.session.completed (webhook order varies).
-        customer = obj.get("customer")
         if obj.get("status") == "trialing" and customer:
             _enforce_trial_fingerprint(customer, obj.get("id"))
         if (obj.get("metadata") or {}).get("trial_granted") == "1" and customer:
@@ -819,43 +928,66 @@ def handle_event(event: dict) -> None:
         # effectively immediate). The actual trial→paid conversion arrives as
         # customer.subscription.updated, so we only log here — no plan change, no
         # email (wire a reminder later if desired).
-        print(f"[caloria] trial_will_end for customer {obj.get('customer')}")
+        print(f"[caloria] trial_will_end for customer {customer}")
 
     elif etype == "customer.subscription.updated":
-        # Tier-aware: a Starter subscription stays Starter (never auto-upgraded).
         status = obj.get("status", "")
-        starter = (obj.get("metadata") or {}).get("tier") == "starter" or _is_starter_customer(obj.get("customer"))
+        sub_id = obj.get("id")
+        sub_tier = _event_tier(obj)
+        # Classify by the subscription's OWN immutable tier stamp (set at checkout).
+        # Fall back to the customer's cached plan ONLY for legacy subs that predate
+        # the stamp — and NEVER to decide a cancellation (see the cancel block).
+        is_starter = (sub_tier == "starter") or (not sub_tier and _is_starter_customer(customer))
         if status in _ACTIVE_STATUSES:
-            plan = "starter" if starter else "premium"
+            # Granting/keeping access always applies (we never withhold access the
+            # live subscription confirms). But only (re)point the stored subscription
+            # id when this event is for the CURRENT sub (or none is recorded yet): a
+            # stale active/trialing event for an OLD sub must not repoint a customer
+            # who has already moved to a newer subscription.
+            plan = "starter" if is_starter else "premium"
+            keep_sub = sub_id if _subscription_is_current(customer, sub_id) else None
+            _set_by_customer(customer, plan=plan, status=status, subscription=keep_sub)
+        elif _subscription_is_current(customer, sub_id):
+            # Downgrade only for the customer's CURRENT subscription — a late/out-of
+            # -order event for an OLD sub must not wipe a newer active one.
+            _set_by_customer(customer, plan="free", status=status, subscription=sub_id)
         else:
-            plan = "free"
-        _set_by_customer(obj.get("customer"), plan=plan, status=status, subscription=obj.get("id"))
-        # Starter = ONE paid month, non-renewing. When its trial converts to a
-        # paying month (status leaves `trialing` for `active`), schedule the
-        # end-of-period cancellation exactly once — current_period_end is now the
-        # end of the FIRST PAID month, so the customer is billed once then stops.
-        # Idempotent: skipped if already set. Premium/Annual are never scheduled.
-        if (starter and status == "active" and obj.get("id")
+            print(f"[caloria] webhook: ignoring stale updated({status}) for old sub "
+                  f"{sub_id} — customer {customer} is on a newer subscription")
+        # Non-renewal is scheduled ONLY for a subscription explicitly stamped
+        # tier=starter at checkout. A Premium subscription (tier=premium, or any
+        # non-starter stamp) is NEVER auto-cancelled here — even when the customer's
+        # cached plan is a stale 'starter' from a prior Starter membership. This is
+        # what stops a legacy Starter record from cancelling a new Premium sub.
+        if (sub_tier == "starter" and status == "active" and sub_id
                 and not obj.get("cancel_at_period_end") and config.stripe_ready()):
             try:
-                _stripe(f"subscriptions/{obj['id']}",
+                _stripe(f"subscriptions/{sub_id}",
                         {"cancel_at_period_end": "true"}, method="POST")
-                print(f"[caloria] starter: scheduled non-renewal (post-trial) for sub {obj['id']}")
+                print(f"[caloria] starter: scheduled non-renewal (post-trial) for sub {sub_id}")
             except BillingError as e:
                 print(f"[caloria] starter: could not schedule post-trial non-renewal: {e}")
 
     elif etype in ("customer.subscription.deleted", "customer.subscription.canceled"):
-        starter = (obj.get("metadata") or {}).get("tier") == "starter" or _is_starter_customer(obj.get("customer"))
-        _set_by_customer(obj.get("customer"), plan="free", status="canceled")
-        if starter:
+        sub_id = obj.get("id")
+        sub_tier = _event_tier(obj)
+        is_starter = (sub_tier == "starter") or (not sub_tier and _is_starter_customer(customer))
+        # Ignore a late delete for an OLD subscription (the customer may already be
+        # on a newer active one). Current sub / none recorded → apply the downgrade.
+        if _subscription_is_current(customer, sub_id):
+            _set_by_customer(customer, plan="free", status="canceled")
+        else:
+            print(f"[caloria] webhook: ignoring stale delete for old sub {sub_id} "
+                  f"— customer {customer} is on a newer subscription")
+        if is_starter:
             # Starter's one month has ended — send the expiration email (deduped).
-            _send_starter_expiry_by_customer(obj.get("customer"))
+            _send_starter_expiry_by_customer(customer)
 
     elif etype == "invoice.payment_failed":
         # Enter grace period; keep access while Stripe retries the card.
-        _set_by_customer(obj.get("customer"), plan="premium", status="past_due")
+        _set_by_customer(customer, plan="premium", status="past_due")
 
     elif etype in ("invoice.paid", "invoice.payment_succeeded"):
         # Preserve a Starter tier on its (single) paid invoice; else Premium.
-        plan = "starter" if _is_starter_customer(obj.get("customer")) else "premium"
-        _set_by_customer(obj.get("customer"), plan=plan, status="active")
+        plan = "starter" if _is_starter_customer(customer) else "premium"
+        _set_by_customer(customer, plan=plan, status="active")
