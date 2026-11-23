@@ -150,11 +150,18 @@ def _ensure_coupon(prize: str) -> str:
     minting and caching it per key-mode in the kv table. `duration=once` so ONLY the
     first invoice is discounted — every renewal then bills the full recurring price
     (this is what makes the promo apply to exactly one billing period, not forever)."""
+    # 1) An explicit coupon id configured in the environment ALWAYS wins — this is
+    #    how the three coupons you created by hand in Stripe get used. No POST, so no
+    #    duplicate coupon is ever created in your account.
+    explicit = config.explicit_coupon_id(prize)
+    if explicit:
+        return explicit
     mode = _key_mode()
     ckey = f"stripe_coupon_{prize}_{mode}"
     cached = db.kv_get(ckey)
     if cached:
         return cached
+    # 2) No explicit id → auto-mint one from the PROMO_* settings (legacy behavior).
     spec = config.wheel_prize_config(prize)["coupon"]
     params = {"duration": "once", "name": f"Caloria {prize} promo"}
     if "percent_off" in spec:

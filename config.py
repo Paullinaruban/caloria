@@ -52,8 +52,9 @@ STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "").strip()
 # and OVERRIDES auto-creation. Leave blank to auto-create the Price from the amounts
 # below (recommended). See explicit_price_id() and billing.create_checkout().
 # PRICING (2026-11): monthly $19.99, quarterly $50/3mo, yearly $125/yr.
-STRIPE_PRICE_MONTHLY = os.environ.get("STRIPE_PRICE_MONTHLY", "").strip()   # the $19.99/month Price id (or blank → auto-mint)
-STRIPE_PRICE_YEARLY  = os.environ.get("STRIPE_PRICE_YEARLY", "").strip()    # LEGACY: if set it OVERRIDES auto-mint — leave BLANK so yearly auto-mints at $125 (never the old $99)
+STRIPE_PRICE_MONTHLY   = os.environ.get("STRIPE_PRICE_MONTHLY", "").strip()    # the $19.99/month Price id (or blank → auto-mint)
+STRIPE_PRICE_YEARLY    = os.environ.get("STRIPE_PRICE_YEARLY", "").strip()     # set to your $125/yr LIVE Price id to use it (or blank → auto-mint at $125; never leave the old $99 here)
+STRIPE_PRICE_QUARTERLY = os.environ.get("STRIPE_PRICE_QUARTERLY", "").strip()  # the $50/3-month Price id (or blank → auto-mint at $50/3mo)
 
 # ============================================================================
 # SUBSCRIPTION PRICING — SINGLE SOURCE OF TRUTH
@@ -122,15 +123,17 @@ def price_monthly_compare_display(now=None):
 PRICE_YEARLY_DISPLAY = _fmt_price("$", YEARLY_PRICE_USD)   # "$125" (static)
 
 
-# Safety backstop for the yearly price change ($99 → $125). If a LEGACY explicit
-# yearly Price id is still configured in the environment, checkout would keep
-# charging the OLD amount instead of auto-minting $125. Warn loudly at startup so it
-# gets unset in Render. (Purely informational — no behavior change here.)
+# Safety backstop for the yearly price change ($99 → $125). An explicit yearly
+# Price id is an accepted, deterministic setup (use your $125 LIVE Price id). The
+# ONLY danger is pointing it at the OLD $99 Price. The code cannot read a Price's
+# amount without an API call, so warn at startup to confirm the id is the $125 one.
+# Leaving it blank also works — yearly then auto-mints at $125. Either way, never
+# the old $99. (Purely informational — no behavior change here.)
 if STRIPE_PRICE_YEARLY or os.environ.get("STRIPE_PRICE_YEARLY_USD", "").strip():
-    print("[caloria][WARN] A yearly Stripe Price id is set (STRIPE_PRICE_YEARLY/"
-          "STRIPE_PRICE_YEARLY_USD). Checkout will use THAT exact Price and ignore "
-          f"YEARLY_PRICE_USD=${YEARLY_PRICE_USD:g}. UNSET it so yearly auto-mints at "
-          "$125 — otherwise the old $99 price can remain active.")
+    print("[caloria][WARN] An explicit yearly Stripe Price id is set "
+          "(STRIPE_PRICE_YEARLY/STRIPE_PRICE_YEARLY_USD). Checkout will charge THAT "
+          f"exact Price and ignore YEARLY_PRICE_USD=${YEARLY_PRICE_USD:g}. CONFIRM it "
+          "is your $125 Price, NOT the old $99 — or leave it blank to auto-mint $125.")
 
 
 # Back-compat: keep the old module attribute names working, resolved LIVE so the
@@ -192,12 +195,15 @@ def stripe_price_id(interval: str, currency: str) -> str:
 
 def explicit_price_id(interval: str, now=None) -> str:
     """Explicit Stripe Price id to use for checkout (overrides auto-creation).
-    Set STRIPE_PRICE_MONTHLY to your $19/month Price id and STRIPE_PRICE_YEARLY to
-    the $125/year id. Returns '' → the Price auto-creates from the amount in config."""
+    Set STRIPE_PRICE_MONTHLY to your $19.99/month Price id, STRIPE_PRICE_YEARLY to
+    the $125/year id, and STRIPE_PRICE_QUARTERLY to the $50/3-month id. Any left
+    blank → that Price auto-creates from the amount in config."""
     if interval == "yearly":
         return STRIPE_PRICE_YEARLY
     if interval == "monthly":
         return STRIPE_PRICE_MONTHLY
+    if interval == "quarterly":
+        return STRIPE_PRICE_QUARTERLY
     return ""
 
 
@@ -556,6 +562,28 @@ WHEEL_OFFER_TTL_HOURS = int(os.environ.get("WHEEL_OFFER_TTL_HOURS", "24"))
 PROMO_YEARLY_PERCENT_OFF      = int(os.environ.get("PROMO_YEARLY_PERCENT_OFF", "60"))
 PROMO_QUARTERLY_PERCENT_OFF   = int(os.environ.get("PROMO_QUARTERLY_PERCENT_OFF", "50"))
 PROMO_MONTHLY_AMOUNT_OFF_CENTS = int(os.environ.get("PROMO_MONTHLY_AMOUNT_OFF_CENTS", "799"))
+
+# Explicit Stripe Coupon ids (recommended for production). If you created the three
+# `duration: once` coupons by hand in the Stripe Dashboard, paste their ids here and
+# the backend uses THEM — it will NOT auto-create its own (no duplicates). Leave a
+# value blank to have the backend auto-mint that coupon from the PROMO_* settings
+# above. The coupon's discount must match the plan: yearly 60% off, quarterly 50%
+# off, monthly $7.99 USD amount_off. (The monthly amount_off coupon MUST be in USD
+# so it applies to the $19.99 USD price and yields exactly $12.)
+STRIPE_COUPON_YEARLY    = os.environ.get("STRIPE_COUPON_YEARLY", "").strip()
+STRIPE_COUPON_QUARTERLY = os.environ.get("STRIPE_COUPON_QUARTERLY", "").strip()
+STRIPE_COUPON_MONTHLY   = os.environ.get("STRIPE_COUPON_MONTHLY", "").strip()
+
+
+def explicit_coupon_id(prize: str) -> str:
+    """Return a hand-configured Stripe Coupon id for a wheel prize, or '' to let the
+    backend auto-mint one. Lets you wire the three coupons you created manually in
+    Stripe to the app instead of having it create duplicates."""
+    return {
+        "yearly":    STRIPE_COUPON_YEARLY,
+        "quarterly": STRIPE_COUPON_QUARTERLY,
+        "monthly":   STRIPE_COUPON_MONTHLY,
+    }.get((prize or "").lower(), "")
 
 
 def wheel_prize_config(prize: str) -> dict:
