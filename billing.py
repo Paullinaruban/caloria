@@ -712,6 +712,24 @@ def _subscription_is_current(customer: str, sub_id: str) -> bool:
     return (not current) or (current == sub_id)
 
 
+def _customer_status(customer: str) -> str:
+    """The subscription_status currently stored on this customer's row (lower-cased,
+    '' if unknown). Used to stop a late/out-of-order invoice event from reactivating
+    a subscription we have already recorded as terminal (canceled/unpaid/expired).
+    Never raises; returns '' on any error so normal customers are unaffected."""
+    if not customer:
+        return ""
+    try:
+        with db.cursor() as c:
+            r = c.execute(
+                "SELECT subscription_status FROM users WHERE stripe_customer=?", (customer,)
+            ).fetchone()
+    except Exception as e:  # noqa: BLE001
+        print(f"[caloria] customer-status check failed (fail-open): {e}")
+        return ""
+    return str((r["subscription_status"] if r else "") or "").lower()
+
+
 def _send_starter_expiry_by_customer(customer) -> None:
     if not customer:
         return
@@ -1064,10 +1082,23 @@ def _dispatch_event(etype: str, obj: dict) -> None:
             _send_starter_expiry_by_customer(customer)
 
     elif etype == "invoice.payment_failed":
-        # Enter grace period; keep access while Stripe retries the card.
-        _set_by_customer(customer, plan="premium", status="past_due")
+        # Enter grace period; keep access while Stripe retries the card. But NEVER
+        # resurrect a subscription we have already recorded as terminal
+        # (canceled/unpaid/expired): a late or out-of-order invoice event for an
+        # ended subscription must not flip a free account back to past_due.
+        if _customer_status(customer) in _TERMINAL_STATUSES:
+            print(f"[caloria] webhook: ignoring {etype} for terminal customer {customer} "
+                  "— not reactivating")
+        else:
+            _set_by_customer(customer, plan="premium", status="past_due")
 
     elif etype in ("invoice.paid", "invoice.payment_succeeded"):
-        # Preserve a Starter tier on its (single) paid invoice; else Premium.
-        plan = "starter" if _is_starter_customer(customer) else "premium"
-        _set_by_customer(customer, plan=plan, status="active")
+        # Preserve a Starter tier on its (single) paid invoice; else Premium. Same
+        # terminal-state guard: a stale paid-invoice event for a canceled/unpaid
+        # subscription must not re-grant paid access.
+        if _customer_status(customer) in _TERMINAL_STATUSES:
+            print(f"[caloria] webhook: ignoring {etype} for terminal customer {customer} "
+                  "— not reactivating")
+        else:
+            plan = "starter" if _is_starter_customer(customer) else "premium"
+            _set_by_customer(customer, plan=plan, status="active")
