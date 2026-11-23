@@ -34,6 +34,7 @@ import db
 import images
 import imagevalid
 import leads
+import wheel
 import learning
 import mealplan
 import pipeline
@@ -250,6 +251,10 @@ class Handler(BaseHTTPRequestHandler):
         "/api/winterarc/unsubscribe",
         # Recovery/marketing one-click unsubscribe (token-based, public).
         "/api/recovery/unsubscribe",
+        # Lucky Wheel (new visitors, pre-account): spin to win a promotional offer +
+        # funnel analytics. No account/session; rate-limited; the redemption id is an
+        # unguessable token and the discount is re-validated at checkout.
+        "/api/wheel/spin", "/api/wheel/event",
     })
 
     # Signed-in pre-paywall funnel: reachable by an AUTHENTICATED user who has not
@@ -342,7 +347,14 @@ class Handler(BaseHTTPRequestHandler):
                 "price_monthly_usd": config.MONTHLY_PRICE_USD,
                 "price_yearly_usd": config.YEARLY_PRICE_USD,
                 "price_monthly_compare_usd": config.MONTHLY_COMPARE_USD,
+                # 3-month ("quarterly") plan — regular price shown on the pricing page.
+                "price_quarterly": f"${int(config.QUARTERLY_PRICE_USD)}"
+                    if float(config.QUARTERLY_PRICE_USD).is_integer()
+                    else f"${config.QUARTERLY_PRICE_USD:.2f}",
+                "price_quarterly_usd": config.QUARTERLY_PRICE_USD,
                 "trial_days": config.TRIAL_DAYS,
+                # Lucky Wheel: enabled flag + display prizes with transparent odds.
+                "wheel": wheel.public_config(),
                 # Public bits the frontend needs (site key is meant to be public).
                 "turnstile_site_key": config.TURNSTILE_SITE_KEY,
                 "require_verification": config.REQUIRE_EMAIL_VERIFICATION,
@@ -356,9 +368,9 @@ class Handler(BaseHTTPRequestHandler):
                 # Seasonal layer flags (snow / card / animations / enabled).
                 "winter_arc": config.winter_arc_public(),
                 # NOTE: the retired Starter plan is intentionally NOT advertised to
-                # the client. Pricing is exactly two options — $19.99/mo and $99/yr.
-                # Existing Starter subscribers keep access via their own plan flag
-                # (/api/me), which does not depend on these config fields.
+                # the client. Standard pricing is $19.99/mo, $50/3mo, $125/yr (plus
+                # the Lucky Wheel promo discounts). Existing Starter subscribers keep
+                # access via their own plan flag (/api/me), independent of these fields.
                 # Diagnostic: is Pillow importable in the RUNNING backend? AI Coach
                 # photo analysis needs it; if false, requirements.txt was not
                 # installed (e.g. an empty Render buildCommand). Safe to expose
@@ -462,6 +474,10 @@ class Handler(BaseHTTPRequestHandler):
             if not self._require_admin():
                 return
             return self._send(200, admin.analytics())
+        if path == "/api/admin/wheel":
+            if not self._require_admin():
+                return
+            return self._send(200, wheel.conversion_summary())
         if path == "/api/admin/ai-usage":
             if not self._require_admin():
                 return
@@ -726,6 +742,8 @@ class Handler(BaseHTTPRequestHandler):
             "/api/onboarding/preview": self._onboarding_preview,
             "/api/lead": self._lead_save,
             "/api/lead/resume": self._lead_resume,
+            "/api/wheel/spin": self._wheel_spin,
+            "/api/wheel/event": self._wheel_event,
             "/api/app/verify/start": self._app_verify_start,
             "/api/app/verify/check": self._app_verify_check,
             "/api/app/register": self._app_register,
@@ -1019,6 +1037,53 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(404, {"error": "not found"})
         self._send(200, {"ok": True, "lead_id": lead["id"], "email": lead["email"],
                          "profile": lead["profile"], "status": lead["status"]})
+
+    # ---- Lucky Wheel (new visitors) ----
+    def _wheel_spin(self, data):
+        """PUBLIC — spin the Lucky Wheel. The BACKEND picks the prize (weighted,
+        secure) and persists a pending redemption BEFORE returning, so the frontend
+        animation merely stops on the prize the server already chose. A session that
+        already holds an active offer gets the SAME one back (refresh never rerolls).
+        The binding new-customer gate runs later at checkout. Rate-limited per IP."""
+        ip = self._client_ip()
+        if self._rate_limited("wheel_spin", ip):
+            return
+        if not config.wheel_ready():
+            return self._send(403, {"error": "The Lucky Wheel is not available right now."})
+        session = data.get("wheel_session")
+        if not (isinstance(session, str) and session):
+            session = wheel.new_session()
+        # Pass identity through only for dedup/binding if a (rare) signed-in visitor
+        # spins; we never trust a client-supplied email for a prize.
+        u = self._user()
+        email = user_id = None
+        if u:
+            keys = u.keys()
+            email = u["email"] if "email" in keys else None
+            user_id = u["id"] if "id" in keys else None
+        try:
+            offer = wheel.create_redemption(session, email=email, user_id=user_id)
+        except wheel.WheelError as e:
+            return self._send(400, {"error": str(e)})
+        self._send(200, {"ok": True, **offer})
+
+    def _wheel_event(self, data):
+        """PUBLIC — append a Lucky Wheel funnel analytics event (popup_shown,
+        spin_initiated, winning_shown, join_clicked, ...). Best-effort, rate-limited."""
+        ip = self._client_ip()
+        if self._rate_limited("wheel_event", ip):
+            return
+        event = data.get("event")
+        if not isinstance(event, str) or not event:
+            return self._send(400, {"error": "event required"})
+        wheel.log_event(
+            event,
+            redemption_id=data.get("redemption_id"),
+            wheel_session=data.get("wheel_session"),
+            prize=data.get("prize"),
+            meta=data.get("meta") if isinstance(data.get("meta"), dict) else None,
+        )
+        self._send(200, {"ok": True})
 
     # ---- NATIVE iOS onboarding (verify-first) ----
     def _app_gate(self) -> bool:
@@ -1638,6 +1703,7 @@ class Handler(BaseHTTPRequestHandler):
         if not self._require_verified(u):
             return
         interval = data.get("interval", "monthly")
+        redemption_id = data.get("redemption_id")
         # Double-charge guard: a customer who already holds a LIVE active/trialing
         # subscription must not be able to start a second checkout (confused click,
         # second tab, direct API call) and be billed twice / get a duplicate sub.
@@ -1647,6 +1713,20 @@ class Handler(BaseHTTPRequestHandler):
                 "error": "You already have an active Caloria membership.",
                 "already_subscribed": True,
             })
+        # Lucky Wheel promo: re-validate the won offer on the BACKEND before checkout
+        # (eligibility, not expired, not already used). This is the binding
+        # new-customer gate — cookies/incognito can't bypass it. On success the
+        # interval is pinned to the won prize and a one-time coupon is applied; the
+        # promo checkout carries NO free trial. NEVER trust a client-supplied price.
+        promo = None
+        if redemption_id:
+            try:
+                promo = wheel.validate_redemption(redemption_id, u)
+                interval = promo["interval"]
+            except wheel.WheelError as e:
+                # The offer can't be applied — tell the frontend so it drops the promo
+                # and continues at the regular price instead of charging the wrong one.
+                return self._send(409, {"error": str(e), "promo_invalid": True})
         # Starter is a one-time ENTRY offer — enforce eligibility on the server so
         # an existing/returning user can't buy it via a direct API call.
         if interval == "starter" and not auth.starter_eligible(u):
@@ -1660,10 +1740,13 @@ class Handler(BaseHTTPRequestHandler):
             # receives the 3-day trial and a returning user is charged immediately —
             # never the reverse. (Previously public_user(u), a trimmed dict, was
             # passed, which made create_checkout mis-judge everyone ineligible.)
+            # `promo` (when present) applies the won discount and bypasses the trial
+            # for THIS checkout only — the regular trial path is untouched.
             url = billing.create_checkout(
                 u, interval,
                 return_base=self.headers.get("Origin", ""),
                 trial_eligible=auth.trial_eligible(u),
+                promo=promo,
             )
         except billing.BillingError as e:
             return self._send(503, {"error": str(e)})
@@ -1671,6 +1754,12 @@ class Handler(BaseHTTPRequestHandler):
             recovery.record_checkout_started(u["id"], interval)
         except Exception as e:  # noqa: BLE001 — must never break checkout
             print(f"[caloria][recovery] record_checkout_started failed: {e}")
+        if promo:
+            try:
+                wheel.log_event("checkout_opened", redemption_id=promo["redemption_id"],
+                                prize=promo["prize"])
+            except Exception:  # noqa: BLE001
+                pass
         self._send(200, {"url": url})
 
     def _billing_confirm(self, data):

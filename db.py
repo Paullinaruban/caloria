@@ -360,6 +360,50 @@ def init_db() -> None:
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
             )"""
         )
+        # --- Lucky Wheel promotional redemptions (new visitors) ----------------
+        # One row per won offer. The BACKEND decides the prize (weighted) and writes
+        # this row BEFORE the result is shown; the discount is re-validated here at
+        # checkout, so clearing cookies / incognito cannot obtain a second/ineligible
+        # promo. `status`: pending -> redeemed (on paid checkout) | expired. Prices
+        # are USD cents. Additive + isolated: never touches users/billing directly.
+        c.execute(
+            """CREATE TABLE IF NOT EXISTS promo_redemptions (
+                redemption_id      TEXT PRIMARY KEY,
+                wheel_session      TEXT,
+                user_id            INTEGER,
+                email              TEXT,
+                prize              TEXT NOT NULL,
+                promo_price_cents  INTEGER,
+                regular_price_cents INTEGER,
+                coupon_id          TEXT,
+                status             TEXT NOT NULL DEFAULT 'pending',
+                stripe_session     TEXT,
+                stripe_subscription TEXT,
+                created_at         TEXT DEFAULT CURRENT_TIMESTAMP,
+                expires_at         TEXT,
+                redeemed_at        TEXT
+            )"""
+        )
+        c.execute("CREATE INDEX IF NOT EXISTS idx_promo_session ON promo_redemptions(wheel_session)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_promo_email ON promo_redemptions(email)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_promo_user ON promo_redemptions(user_id)")
+        # --- Lucky Wheel funnel analytics -------------------------------------
+        # Append-only event log for the wheel funnel (popup_shown, spin_initiated,
+        # prize_selected, winning_shown, join_clicked, onboarding_started,
+        # registration_completed, checkout_opened, payment_success/failed,
+        # subscription_activated). Read by GET /api/admin/wheel for conversion rates.
+        c.execute(
+            """CREATE TABLE IF NOT EXISTS wheel_events (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                redemption_id TEXT,
+                wheel_session TEXT,
+                event         TEXT NOT NULL,
+                prize         TEXT,
+                meta_json     TEXT,
+                created_at    TEXT DEFAULT CURRENT_TIMESTAMP
+            )"""
+        )
+        c.execute("CREATE INDEX IF NOT EXISTS idx_wheel_events_event ON wheel_events(event)")
         # Historical safeguard (one-time, idempotent, FLAG-ONLY). Every account that
         # ever subscribed is marked trial_used so it can NEVER be offered the 3-day
         # trial — independent of the created_at launch cutoff. This touches ONLY the

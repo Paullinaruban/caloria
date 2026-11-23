@@ -140,13 +140,25 @@ def main():
     if not key:
         sys.exit("STRIPE_SECRET_KEY not set in this environment — aborting (no access).")
     apply = "--apply" in sys.argv
+    # Optional: scope to ONE subscription only (safety — never touch other
+    # customers who may have legitimately cancelled during their own trial).
+    # Usage: --subscription sub_xxx   or   --subscription=sub_xxx
+    target = ""
+    for i, a in enumerate(sys.argv):
+        if a == "--subscription" and i + 1 < len(sys.argv):
+            target = sys.argv[i + 1].strip()
+        elif a.startswith("--subscription="):
+            target = a.split("=", 1)[1].strip()
     api = _make_api(key)
     mode = "LIVE" if key.startswith("sk_live") else "TEST"
-    print(f"=== repair_trials.py  mode={mode}  {'APPLY' if apply else 'DRY-RUN'} ===")
+    print(f"=== repair_trials.py  mode={mode}  {'APPLY' if apply else 'DRY-RUN'}"
+          f"{('  scope=' + target) if target else '  scope=ALL-trialing'} ===")
 
     inspected = scheduled = repaired = 0
     missing_pm, failed = [], []
     for s in iter_trialing(api):
+        if target and s.get("id") != target:
+            continue           # scoped run: ignore every other subscription
         inspected += 1
         if s.get("status") != "trialing":
             continue

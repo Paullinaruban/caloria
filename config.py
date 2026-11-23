@@ -49,11 +49,11 @@ USDA_DATA_TYPES = ["Foundation", "SR Legacy"]  # reliable per-100g profiles
 STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY", "").strip()
 STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "").strip()
 # Explicit Stripe Price ids (price_...). When set, checkout uses EXACTLY that Price
-# and OVERRIDES auto-creation. Set STRIPE_PRICE_MONTHLY to your $19/month Price id
-# and STRIPE_PRICE_YEARLY to your $99/year Price id. Leave blank to auto-create the
-# Price from the amounts below. See explicit_price_id() and billing.create_checkout().
-STRIPE_PRICE_MONTHLY = os.environ.get("STRIPE_PRICE_MONTHLY", "").strip()   # the $19/month Price id
-STRIPE_PRICE_YEARLY  = os.environ.get("STRIPE_PRICE_YEARLY", "").strip()    # the $99/year Price id
+# and OVERRIDES auto-creation. Leave blank to auto-create the Price from the amounts
+# below (recommended). See explicit_price_id() and billing.create_checkout().
+# PRICING (2026-11): monthly $19.99, quarterly $50/3mo, yearly $125/yr.
+STRIPE_PRICE_MONTHLY = os.environ.get("STRIPE_PRICE_MONTHLY", "").strip()   # the $19.99/month Price id (or blank → auto-mint)
+STRIPE_PRICE_YEARLY  = os.environ.get("STRIPE_PRICE_YEARLY", "").strip()    # LEGACY: if set it OVERRIDES auto-mint — leave BLANK so yearly auto-mints at $125 (never the old $99)
 
 # ============================================================================
 # SUBSCRIPTION PRICING — SINGLE SOURCE OF TRUTH
@@ -63,7 +63,8 @@ STRIPE_PRICE_YEARLY  = os.environ.get("STRIPE_PRICE_YEARLY", "").strip()    # th
 # currency, /api/config, the landing hero/paywalls, and admin MRR — reads the
 # helpers below, so one change updates everything at once. All env-overridable.
 # The actual Stripe charge uses STRIPE_PRICE_MONTHLY (your $19.99 Price id); if
-# unset, a Price is auto-created from MONTHLY_PRICE_USD. Yearly is fixed at $99.
+# unset, a Price is auto-created from MONTHLY_PRICE_USD. Standard plans: monthly
+# $19.99, quarterly $50/3mo, yearly $125/yr (all auto-minted when no Price id set).
 # ============================================================================
 import datetime as _dt
 
@@ -72,7 +73,9 @@ import datetime as _dt
 # customer is actually billed ($19.99).
 MONTHLY_PRICE_USD_BASE = float(os.environ.get("MONTHLY_PRICE_USD", "19.99"))  # display; charge = STRIPE_PRICE_MONTHLY
 MONTHLY_COMPARE_USD    = float(os.environ.get("MONTHLY_COMPARE_USD", "25"))   # struck-through "was" price
-YEARLY_PRICE_USD       = float(os.environ.get("YEARLY_PRICE_USD", "99"))
+YEARLY_PRICE_USD       = float(os.environ.get("YEARLY_PRICE_USD", "125"))
+# 3-month ("quarterly") plan — regular $50 per 3 months (recurring: month ×3).
+QUARTERLY_PRICE_USD    = float(os.environ.get("QUARTERLY_PRICE_USD", "50"))
 
 
 def promo_active(now=None) -> bool:
@@ -92,7 +95,10 @@ def _fmt_price(symbol, amt) -> str:
 
 # Per-USD multiplier to derive each market's MONTHLY amount from the USD price.
 _MONTHLY_FX_PER_USD = {"USD": 1.0, "EUR": 1.0, "GBP": 1.0, "THB": 35.0}
-_YEARLY_MINOR = {"USD": 9900, "THB": 349900, "EUR": 9900, "GBP": 8400}
+_YEARLY_MINOR = {"USD": 12500, "THB": 437500, "EUR": 12500, "GBP": 10500}
+# 3-month plan minor units ($50 base). USD is authoritative; others approximate for
+# Adaptive Pricing fallback (the promo is a USD offer → run with BASE_CURRENCY=USD).
+_QUARTERLY_MINOR = {"USD": 5000, "THB": 175000, "EUR": 5000, "GBP": 4200}
 
 
 def _monthly_minor_units(currency: str, now=None) -> int:
@@ -113,7 +119,18 @@ def price_monthly_compare_display(now=None):
     return _fmt_price("$", MONTHLY_COMPARE_USD)                  # "$25"
 
 
-PRICE_YEARLY_DISPLAY = _fmt_price("$", YEARLY_PRICE_USD)   # "$99" (static)
+PRICE_YEARLY_DISPLAY = _fmt_price("$", YEARLY_PRICE_USD)   # "$125" (static)
+
+
+# Safety backstop for the yearly price change ($99 → $125). If a LEGACY explicit
+# yearly Price id is still configured in the environment, checkout would keep
+# charging the OLD amount instead of auto-minting $125. Warn loudly at startup so it
+# gets unset in Render. (Purely informational — no behavior change here.)
+if STRIPE_PRICE_YEARLY or os.environ.get("STRIPE_PRICE_YEARLY_USD", "").strip():
+    print("[caloria][WARN] A yearly Stripe Price id is set (STRIPE_PRICE_YEARLY/"
+          "STRIPE_PRICE_YEARLY_USD). Checkout will use THAT exact Price and ignore "
+          f"YEARLY_PRICE_USD=${YEARLY_PRICE_USD:g}. UNSET it so yearly auto-mints at "
+          "$125 — otherwise the old $99 price can remain active.")
 
 
 # Back-compat: keep the old module attribute names working, resolved LIVE so the
@@ -176,7 +193,7 @@ def stripe_price_id(interval: str, currency: str) -> str:
 def explicit_price_id(interval: str, now=None) -> str:
     """Explicit Stripe Price id to use for checkout (overrides auto-creation).
     Set STRIPE_PRICE_MONTHLY to your $19/month Price id and STRIPE_PRICE_YEARLY to
-    the $99/year id. Returns '' → the Price auto-creates from the amount in config."""
+    the $125/year id. Returns '' → the Price auto-creates from the amount in config."""
     if interval == "yearly":
         return STRIPE_PRICE_YEARLY
     if interval == "monthly":
@@ -206,6 +223,8 @@ def base_amount(interval: str, currency: str, now=None) -> int:
     currency = normalize_currency(currency)
     if interval == "monthly":
         default = _monthly_minor_units(currency, now)
+    elif interval == "quarterly":
+        default = _QUARTERLY_MINOR.get(currency, _QUARTERLY_MINOR["USD"])
     else:
         default = _YEARLY_MINOR.get(currency, _YEARLY_MINOR["USD"])
     try:
@@ -225,8 +244,10 @@ def price_currency_options(interval: str, base_currency: str, now=None) -> dict:
     base = normalize_currency(base_currency)
     if interval == "monthly":
         amounts = {c: _monthly_minor_units(c, now) for c in ("USD", "EUR", "GBP")}
+    elif interval == "quarterly":
+        amounts = {"USD": 5000, "EUR": 5000, "GBP": 4200}
     else:
-        amounts = {"USD": 9900, "EUR": 9900, "GBP": 8400}
+        amounts = {"USD": 12500, "EUR": 12500, "GBP": 10500}
     out = {}
     for cur, amt in amounts.items():
         if cur == base:
@@ -242,20 +263,23 @@ def base_display() -> dict:
     """Monthly/yearly display strings for the BASE_CURRENCY (shown pre-checkout)."""
     disp = currency_display()
     d = disp.get(BASE_CURRENCY, disp["USD"])
-    return {"symbol": d["symbol"], "monthly": d["monthly"], "yearly": d["yearly"]}
+    return {"symbol": d["symbol"], "monthly": d["monthly"],
+            "quarterly": d.get("quarterly"), "yearly": d["yearly"]}
 
 
 def currency_display(now=None) -> dict:
     """Per-currency symbol + monthly/yearly display strings for the UI. Monthly
     reflects the CURRENT price."""
     syms = {"USD": "$", "THB": "฿", "EUR": "€", "GBP": "£"}
-    yearly = {"USD": "$99", "THB": "฿3,499", "EUR": "€99", "GBP": "£84"}
+    yearly = {"USD": "$125", "THB": "฿4,375", "EUR": "€125", "GBP": "£105"}
+    quarterly = {"USD": "$50", "THB": "฿1,750", "EUR": "€50", "GBP": "£42"}
     out = {}
     for cur, sym in syms.items():
         monthly = _fmt_price(sym, _monthly_minor_units(cur, now) / 100)
         out[cur] = {
             "symbol": sym,
             "monthly": os.environ.get(f"PRICE_MONTHLY_{cur}_DISPLAY", monthly).strip(),
+            "quarterly": os.environ.get(f"PRICE_QUARTERLY_{cur}_DISPLAY", quarterly[cur]).strip(),
             "yearly": os.environ.get(f"PRICE_YEARLY_{cur}_DISPLAY", yearly[cur]).strip(),
         }
     return out
@@ -492,6 +516,80 @@ STRIPE_PRICE_STARTER  = os.environ.get("STRIPE_PRICE_STARTER", "").strip()
 # Caloria Starter is DISCONTINUED as a public option (off by default). Existing
 # Starter subscribers are unaffected; only new Starter checkouts are blocked.
 STARTER_ENABLED       = os.environ.get("STARTER_ENABLED", "false").lower() == "true"
+
+
+# --- Lucky Wheel promotion (new visitors) -----------------------------------
+# A 5-second popup where an eligible NEW visitor spins a weighted wheel and wins a
+# discounted FIRST billing period on one plan, then renews at the regular price.
+# The backend decides the prize (weighted, secure) and the discount is applied via
+# a Stripe `duration: once` coupon — so only the first invoice is discounted and
+# every renewal bills the full recurring price. The regular $19.99 monthly + its
+# 3-day trial are UNTOUCHED; promotional checkouts simply bypass the trial.
+WHEEL_ENABLED = os.environ.get("WHEEL_ENABLED", "true").lower() == "true"
+
+# Win-weights (odds of each prize). Priority: yearly > quarterly > monthly. Secure
+# weighted selection on the BACKEND — never a frontend RNG, never equal odds.
+# These are the odds of WINNING each prize, distinct from the per-plan discount %.
+def _wheel_weight(prize: str, default: int) -> int:
+    try:
+        return max(0, int(os.environ.get(f"WHEEL_WEIGHT_{prize.upper()}", default)))
+    except ValueError:
+        return default
+
+WHEEL_WEIGHTS = {
+    "yearly":    _wheel_weight("yearly", 60),
+    "quarterly": _wheel_weight("quarterly", 25),
+    "monthly":   _wheel_weight("monthly", 15),
+}
+# Prize display order on the wheel + priority order (highest odds first).
+WHEEL_PRIZE_ORDER = ("yearly", "quarterly", "monthly")
+
+# A won offer is valid for this many hours before it expires (re-validated on the
+# backend at checkout).
+WHEEL_OFFER_TTL_HOURS = int(os.environ.get("WHEEL_OFFER_TTL_HOURS", "24"))
+
+# Promo discounts (first billing period only) applied as Stripe `duration: once`
+# coupons, auto-minted from these settings and cached per key-mode in the kv table.
+#   • Yearly  : 60% off  → $125 → $50 first year
+#   • Quarterly: 50% off → $50  → $25 first 3 months
+#   • Monthly : $7.99 off (amount_off, USD) → $19.99 → exactly $12 first month
+PROMO_YEARLY_PERCENT_OFF      = int(os.environ.get("PROMO_YEARLY_PERCENT_OFF", "60"))
+PROMO_QUARTERLY_PERCENT_OFF   = int(os.environ.get("PROMO_QUARTERLY_PERCENT_OFF", "50"))
+PROMO_MONTHLY_AMOUNT_OFF_CENTS = int(os.environ.get("PROMO_MONTHLY_AMOUNT_OFF_CENTS", "799"))
+
+
+def wheel_prize_config(prize: str) -> dict:
+    """Regular + promotional USD prices and the coupon spec for a wheel prize.
+    Prices are in whole-USD-cents; the coupon is applied once at checkout so the
+    FIRST invoice is discounted and every renewal bills the regular amount."""
+    prize = (prize or "").lower()
+    if prize == "yearly":
+        regular = int(round(YEARLY_PRICE_USD * 100))
+        off = PROMO_YEARLY_PERCENT_OFF
+        return {"prize": "yearly", "interval": "yearly",
+                "regular_cents": regular,
+                "promo_cents": int(round(regular * (100 - off) / 100)),
+                "coupon": {"percent_off": off}}
+    if prize == "quarterly":
+        regular = int(round(QUARTERLY_PRICE_USD * 100))
+        off = PROMO_QUARTERLY_PERCENT_OFF
+        return {"prize": "quarterly", "interval": "quarterly",
+                "regular_cents": regular,
+                "promo_cents": int(round(regular * (100 - off) / 100)),
+                "coupon": {"percent_off": off}}
+    if prize == "monthly":
+        regular = int(round(MONTHLY_PRICE_USD_BASE * 100))
+        off = PROMO_MONTHLY_AMOUNT_OFF_CENTS
+        return {"prize": "monthly", "interval": "monthly",
+                "regular_cents": regular,
+                "promo_cents": max(0, regular - off),
+                "coupon": {"amount_off": off, "currency": "usd"}}
+    raise ValueError(f"unknown wheel prize: {prize!r}")
+
+
+def wheel_ready() -> bool:
+    """True when the wheel is enabled and at least one prize has positive odds."""
+    return bool(WHEEL_ENABLED) and sum(WHEEL_WEIGHTS.values()) > 0
 
 
 def starter_ready() -> bool:

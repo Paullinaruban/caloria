@@ -125,13 +125,16 @@ def _ensure_price(interval: str, currency: str = None) -> str:
         db.kv_set(f"stripe_product_{mode}", product_id)
 
     amount = config.base_amount(interval, currency)
-    recur = "month" if interval == "monthly" else "year"
+    # quarterly = a 3-month recurring price (month × 3); monthly = month; yearly = year.
+    recur = "month" if interval in ("monthly", "quarterly") else "year"
     params = {
         "product": product_id,
         "unit_amount": amount,
         "currency": currency.lower(),
         "recurring[interval]": recur,
     }
+    if interval == "quarterly":
+        params["recurring[interval_count]"] = 3
     for cur, amt in opts.items():
         params[f"currency_options[{cur.lower()}][unit_amount]"] = amt
     price = _stripe(
@@ -140,6 +143,28 @@ def _ensure_price(interval: str, currency: str = None) -> str:
     )
     db.kv_set(ckey, price["id"])
     return price["id"]
+
+
+def _ensure_coupon(prize: str) -> str:
+    """Return a Stripe Coupon id for a Lucky-Wheel prize's first-period discount,
+    minting and caching it per key-mode in the kv table. `duration=once` so ONLY the
+    first invoice is discounted — every renewal then bills the full recurring price
+    (this is what makes the promo apply to exactly one billing period, not forever)."""
+    mode = _key_mode()
+    ckey = f"stripe_coupon_{prize}_{mode}"
+    cached = db.kv_get(ckey)
+    if cached:
+        return cached
+    spec = config.wheel_prize_config(prize)["coupon"]
+    params = {"duration": "once", "name": f"Caloria {prize} promo"}
+    if "percent_off" in spec:
+        params["percent_off"] = spec["percent_off"]
+    else:
+        params["amount_off"] = spec["amount_off"]
+        params["currency"] = spec.get("currency", "usd")
+    coupon = _stripe("coupons", params, idempotency_key=f"coupon_{prize}_{mode}")
+    db.kv_set(ckey, coupon["id"])
+    return coupon["id"]
 
 
 def _pending_key(user_id) -> str:
@@ -155,9 +180,21 @@ def clear_pending_checkout(user_id) -> None:
         print(f"[caloria] clear pending checkout failed for {user_id}: {e}")
 
 
-def create_checkout(user, interval: str, return_base: str = "", *, trial_eligible=None) -> str:
-    if interval not in ("monthly", "yearly", "starter"):
+def create_checkout(user, interval: str, return_base: str = "", *, trial_eligible=None, promo=None) -> str:
+    if interval not in ("monthly", "yearly", "quarterly", "starter"):
         raise BillingError("Invalid plan interval.")
+
+    # A promotional (Lucky Wheel) checkout pins the interval to the WON prize and
+    # applies a one-time coupon for the first billing period only. It NEVER includes
+    # a free trial: the promo first payment ($12 / $25 / $50) is charged immediately
+    # and renewals bill the full price. This is what keeps the regular $19.99 Monthly
+    # trial completely separate — only promo checkouts bypass the trial.
+    promo_id = None
+    if promo:
+        interval = promo.get("interval", interval)
+        promo_id = promo.get("redemption_id")
+        if interval not in ("monthly", "yearly", "quarterly"):
+            raise BillingError("Invalid promotional plan.")
 
     # ---- de-duplicate: reuse a recent, still-open session for this user+interval
     # instead of creating a second one. Guards against double-clicks, the browser
@@ -169,7 +206,7 @@ def create_checkout(user, interval: str, return_base: str = "", *, trial_eligibl
     if cached:
         try:
             rec = json.loads(cached)
-            if (rec.get("interval") == interval and rec.get("url")
+            if (rec.get("interval") == interval and rec.get("promo") == promo_id and rec.get("url")
                     and (time.time() - float(rec.get("ts", 0))) < _CHECKOUT_REUSE_SECONDS):
                 print(f"[caloria] checkout: reusing session {rec.get('session')} for user {user['id']}")
                 return rec["url"]
@@ -234,6 +271,23 @@ def create_checkout(user, interval: str, return_base: str = "", *, trial_eligibl
         params["customer"] = existing_customer
         params.pop("customer_email", None)
 
+    # ---- Lucky Wheel promotional discount (first billing period only) ----------
+    # Apply the prize's `duration: once` coupon so ONLY the first invoice is
+    # discounted; every renewal bills the full recurring price. Stripe rejects
+    # `discounts` together with `allow_promotion_codes`, so drop the latter for a
+    # promo checkout. Stamp the redemption id so the webhook can mark it redeemed.
+    if promo:
+        coupon_id = _ensure_coupon(promo["prize"])
+        params["discounts[0][coupon]"] = coupon_id
+        params.pop("allow_promotion_codes", None)
+        params["metadata[redemption_id]"] = promo_id
+        params["subscription_data[metadata][redemption_id]"] = promo_id
+        try:
+            import wheel
+            wheel.mark_coupon(promo_id, coupon_id)
+        except Exception as e:  # noqa: BLE001 — bookkeeping only
+            print(f"[caloria] wheel.mark_coupon failed: {e}")
+
     # Free trial — ONE-TIME, new-account-only. trial_eligible() blocks a second
     # trial for anyone who has used one, ever subscribed, or has a Stripe
     # subscription on record (returning customers are charged immediately). The
@@ -250,7 +304,11 @@ def create_checkout(user, interval: str, return_base: str = "", *, trial_eligibl
     # $19.99 charge instead of 3 free days. The explicit argument removes that
     # whole class of bug. Fallback recompute only if a caller omits it.
     eligible = auth.trial_eligible(user) if trial_eligible is None else bool(trial_eligible)
-    grant_trial = config.TRIAL_DAYS > 0 and eligible
+    # Separate trial handling: the trial block runs ONLY for a regular (non-promo)
+    # checkout. A promotional Lucky-Wheel checkout bypasses the trial entirely so the
+    # promo first payment is charged immediately — the regular $19.99 Monthly trial
+    # and its eligibility logic are left exactly as they are.
+    grant_trial = (promo is None) and config.TRIAL_DAYS > 0 and eligible
     if grant_trial:
         params["subscription_data[trial_period_days]"] = config.TRIAL_DAYS
         # CRITICAL: pin what happens when the trial ends. Without this, Stripe uses
@@ -264,6 +322,9 @@ def create_checkout(user, interval: str, return_base: str = "", *, trial_eligibl
         # trial_used reliably regardless of event ordering.
         params["metadata[trial_granted]"] = "1"
         params["subscription_data[metadata][trial_granted]"] = "1"
+    elif promo:
+        print(f"[caloria] checkout: promo {promo_id} ({interval}) for user {user['id']} "
+              f"— no trial, first payment charged now")
     else:
         print(f"[caloria] checkout: no trial for user {user['id']} "
               f"(ineligible/returning) — immediate charge")
@@ -272,14 +333,14 @@ def create_checkout(user, interval: str, return_base: str = "", *, trial_eligibl
     # slip past the cache check at the same instant still collapse to ONE session
     # at Stripe's side instead of creating duplicates.
     bucket = int(time.time() // _CHECKOUT_REUSE_SECONDS)
-    idem = f"checkout_{user['id']}_{interval}_{_key_mode()}_{bucket}"
+    idem = f"checkout_{user['id']}_{interval}_{promo_id or 'none'}_{_key_mode()}_{bucket}"
     session = _stripe("checkout/sessions", params, idempotency_key=idem)
 
     # Remember it so the very next click reuses this exact session.
     try:
         db.kv_set(pkey, json.dumps({
             "session": session["id"], "url": session["url"],
-            "interval": interval, "ts": time.time(),
+            "interval": interval, "promo": promo_id, "ts": time.time(),
         }))
     except Exception as e:  # noqa: BLE001 — remembering is best-effort
         print(f"[caloria] remember pending checkout failed for {user['id']}: {e}")
@@ -898,6 +959,18 @@ def _dispatch_event(etype: str, obj: dict) -> None:
             if (obj.get("metadata") or {}).get("trial_granted") == "1":
                 with db.cursor() as c:
                     c.execute("UPDATE users SET trial_used=1 WHERE id=?", (int(user_id),))
+            # Lucky Wheel: if this checkout carried a won offer, mark it redeemed so
+            # it can never be reused and the admin conversion report updates.
+            redemption_id = (obj.get("metadata") or {}).get("redemption_id")
+            if redemption_id:
+                try:
+                    import wheel
+                    wheel.mark_redeemed(redemption_id, user_id=int(user_id),
+                                        customer=obj.get("customer"),
+                                        subscription=obj.get("subscription"),
+                                        session=obj.get("id"))
+                except Exception as e:  # noqa: BLE001 — must never break activation
+                    print(f"[caloria] wheel.mark_redeemed failed: {e}")
             clear_pending_checkout(int(user_id))
             if is_starter and obj.get("subscription") and config.TRIAL_DAYS <= 0:
                 # No trial: make it NON-RENEWING now — bill this one month, then

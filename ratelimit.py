@@ -41,6 +41,10 @@ LIMITS = {
     # must leave real headroom. Duplicate emails are deduped regardless.
     "club_join": (30, 3600),     # 30 joins/hour/IP
     "club_answers": (120, 3600), # 3 taps per join × the same shared-IP crowd
+    # Lucky Wheel: spins are deduped per session (no reroll), so this is just an
+    # anti-abuse cap; events are analytics beacons (generous). Shared-NAT headroom.
+    "wheel_spin": (40, 3600),    # 40 spins/hour/IP
+    "wheel_event": (400, 3600),  # funnel analytics beacons/hour/IP
 }
 
 
